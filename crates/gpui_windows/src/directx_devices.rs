@@ -114,11 +114,14 @@ fn get_adapter(
 )> {
     for adapter_index in 0.. {
         let adapter: IDXGIAdapter1 = match unsafe {
-            dxgi_factory.EnumAdapterByGpuPreference(adapter_index, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
+            dxgi_factory.EnumAdapterByGpuPreference::<IDXGIAdapter1>(
+                adapter_index,
+                DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+            )
         } {
-            Ok(adapter) => adapter.cast()?,
-            Err(_) => match unsafe { dxgi_factory.EnumAdapters(adapter_index) } {
-                Ok(adapter) => adapter.cast()?,
+            Ok(adapter) => adapter,
+            Err(_) => match unsafe { dxgi_factory.EnumAdapters::<IDXGIAdapter1>(adapter_index) } {
+                Ok(adapter) => adapter,
                 Err(_) => break,
             },
         };
