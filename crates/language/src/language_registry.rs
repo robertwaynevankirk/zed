@@ -752,7 +752,9 @@ impl LanguageRegistry {
                                     .and_then(OsStr::to_str)
                                     .context("invalid grammar filename")?;
                                 anyhow::Ok(with_parser(|parser| {
-                                    let mut store = parser.take_wasm_store().unwrap();
+                                    let mut store = parser
+                                        .take_wasm_store()
+                                        .context("WASM parser store not supported on this platform")?;
                                     let grammar = store.load_language(grammar_name, &wasm_bytes);
                                     parser.set_wasm_store(store).unwrap();
                                     grammar

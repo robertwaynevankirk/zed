@@ -136,6 +136,7 @@ where
 {
     let mut parser = PARSERS.lock().pop().unwrap_or_else(|| {
         let mut parser = Parser::new();
+        #[cfg(not(windows))]
         parser
             .set_wasm_store(WasmStore::new(&WASM_ENGINE).unwrap())
             .unwrap();
