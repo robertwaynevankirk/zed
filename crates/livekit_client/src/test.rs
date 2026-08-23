@@ -47,7 +47,13 @@ pub struct SessionStats {
 }
 
 #[derive(Clone, Debug, Default)]
+pub struct RtcGeneralStats {
+    pub id: String,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct InboundRtpStats {
+    pub rtc: RtcGeneralStats,
     pub stream: RtpStreamStats,
     pub received: ReceivedRtpStreamStats,
     pub inbound: InboundRtpStreamStats,
@@ -73,6 +79,7 @@ pub struct InboundRtpStreamStats {
     pub concealed_samples: u64,
     pub concealment_events: u64,
     pub inserted_samples_for_deceleration: u64,
+    pub removed_samples_for_acceleration: u64,
 }
 
 #[derive(Clone, Debug, Default)]
