@@ -266,7 +266,7 @@ struct TextProvider<'a>(&'a Rope);
 
 struct ByteChunks<'a>(text::Chunks<'a>);
 
-pub(crate) struct QueryCursorHandle(Option<QueryCursor>);
+pub(crate) struct QueryCursorHandle(Option<Box<QueryCursor>>);
 
 impl SyntaxMap {
     pub fn new(text: &BufferSnapshot) -> Self {
@@ -2127,7 +2127,11 @@ impl<'a> tree_sitter::TextProvider<&'a [u8]> for TextProvider<'a> {
     type I = ByteChunks<'a>;
 
     fn text(&mut self, node: tree_sitter::Node) -> Self::I {
-        ByteChunks(self.0.chunks_in_range(node.byte_range()))
+        let len = self.0.len();
+        let range = node.byte_range();
+        let start = range.start.min(len);
+        let end = range.end.min(len).max(start);
+        ByteChunks(self.0.chunks_in_range(start..end))
     }
 }
 
@@ -2141,8 +2145,9 @@ impl<'a> Iterator for ByteChunks<'a> {
 
 impl QueryCursorHandle {
     pub fn new() -> Self {
-        let mut cursor = QUERY_CURSORS.lock().pop().unwrap_or_default();
+        let mut cursor = QUERY_CURSORS.lock().pop().unwrap_or_else(|| Box::new(QueryCursor::new()));
         cursor.set_match_limit(64);
+        cursor.set_max_start_depth(None);
         QueryCursorHandle(Some(cursor))
     }
 }
@@ -2163,12 +2168,14 @@ impl DerefMut for QueryCursorHandle {
 
 impl Drop for QueryCursorHandle {
     fn drop(&mut self) {
-        let mut cursor = self.0.take().unwrap();
-        cursor.set_byte_range(0..usize::MAX);
-        cursor.set_point_range(Point::zero().to_ts_point()..Point::MAX.to_ts_point());
-        cursor.set_containing_byte_range(0..usize::MAX);
-        cursor.set_containing_point_range(Point::zero().to_ts_point()..Point::MAX.to_ts_point());
-        QUERY_CURSORS.lock().push(cursor)
+        if let Some(mut cursor) = self.0.take() {
+            cursor.set_byte_range(0..usize::MAX);
+            cursor.set_point_range(Point::zero().to_ts_point()..Point::MAX.to_ts_point());
+            cursor.set_containing_byte_range(0..usize::MAX);
+            cursor.set_containing_point_range(Point::zero().to_ts_point()..Point::MAX.to_ts_point());
+            cursor.set_max_start_depth(None);
+            QUERY_CURSORS.lock().push(cursor);
+        }
     }
 }
 

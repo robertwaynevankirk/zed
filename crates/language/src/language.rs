@@ -126,7 +126,7 @@ pub(crate) fn to_settings_soft_wrap(value: language_core::SoftWrap) -> settings:
     }
 }
 
-static QUERY_CURSORS: Mutex<Vec<QueryCursor>> = Mutex::new(vec![]);
+pub(crate) static QUERY_CURSORS: Mutex<Vec<Box<QueryCursor>>> = Mutex::new(vec![]);
 static PARSERS: Mutex<Vec<Parser>> = Mutex::new(vec![]);
 
 #[ztracing::instrument(skip_all)]
