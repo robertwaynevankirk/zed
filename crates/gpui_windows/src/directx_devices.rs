@@ -120,8 +120,8 @@ fn get_adapter(
             )
         } {
             Ok(adapter) => adapter,
-            Err(_) => match unsafe { dxgi_factory.EnumAdapters::<IDXGIAdapter1>(adapter_index) } {
-                Ok(adapter) => adapter,
+            Err(_) => match unsafe { dxgi_factory.EnumAdapters(adapter_index) } {
+                Ok(adapter) => adapter.cast()?,
                 Err(_) => break,
             },
         };
