@@ -1,6 +1,7 @@
 use acp_thread::{
     AgentConnection, AgentSessionInfo, AgentSessionList, AgentSessionListRequest,
-    AgentSessionListResponse, ElicitationStore,
+    AgentSessionListResponse, AgentSessionSteer, AgentSessionSteerResponse, ClientUserMessageId,
+    ElicitationStore,
 };
 use action_log::ActionLog;
 use agent_client_protocol::schema::{
@@ -21,7 +22,7 @@ use project::agent_server_store::{
 };
 use project::{AgentId, Project};
 use remote::remote_client::Interactive;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use settings::{AgentConfigOptionValue, SettingsStore};
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
@@ -403,6 +404,7 @@ pub struct AcpConnection {
     auth_methods: Vec<acp::AuthMethod>,
     agent_server_store: WeakEntity<AgentServerStore>,
     agent_capabilities: acp::AgentCapabilities,
+    supports_external_steer: bool,
     request_elicitations: Entity<ElicitationStore>,
     defaults: AcpConnectionDefaults,
     child: Option<Child>,
@@ -413,6 +415,51 @@ pub struct AcpConnection {
     _dispatch_task: Task<()>,
     _wait_task: Task<Result<()>>,
     _stderr_task: Task<Result<()>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcRequest)]
+#[request(method = "_opencode/session/steer", response = ExternalSteerResponse)]
+#[serde(rename_all = "camelCase")]
+struct ExternalSteerRequest {
+    session_id: acp::SessionId,
+    prompt: Vec<acp::ContentBlock>,
+    request_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, agent_client_protocol::JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+struct ExternalSteerResponse {
+    accepted: bool,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+struct AcpSessionSteer {
+    connection: ConnectionTo<Agent>,
+    session_id: acp::SessionId,
+}
+
+impl AgentSessionSteer for AcpSessionSteer {
+    fn run(
+        &self,
+        prompt: Vec<acp::ContentBlock>,
+        request_id: ClientUserMessageId,
+        cx: &mut App,
+    ) -> Task<Result<AgentSessionSteerResponse>> {
+        let connection = self.connection.clone();
+        let request = ExternalSteerRequest {
+            session_id: self.session_id.clone(),
+            prompt,
+            request_id: request_id.as_str().to_owned(),
+        };
+        cx.foreground_executor().spawn(async move {
+            let response = connection.send_request(request).block_task().await?;
+            Ok(AgentSessionSteerResponse {
+                accepted: response.accepted,
+                reason: response.reason,
+            })
+        })
+    }
 }
 
 #[derive(Clone, Default)]
@@ -821,30 +868,29 @@ impl AcpConnection {
                 .cloned()
         });
         let original_command = command.clone();
-        let (path, args, env) = project
-            .read_with(cx, |project, cx| {
-                project.remote_client().and_then(|client| {
-                    let template = client
-                        .read(cx)
-                        .build_command(
-                            Some(command.path.display().to_string()),
-                            &command.args,
-                            &command.env.clone().into_iter().flatten().collect(),
-                            root_dir.as_ref().map(|path| path.display().to_string()),
-                            None,
-                            Interactive::No,
-                        )
-                        .log_err()?;
-                    Some((template.program, template.args, template.env))
-                })
-            })
-            .unwrap_or_else(|| {
-                (
-                    command.path.display().to_string(),
-                    command.args,
-                    command.env.unwrap_or_default(),
+        let remote_command = project.read_with(cx, |project, cx| {
+            project.remote_client().map(|client| {
+                client.read(cx).build_command(
+                    Some(command.path.display().to_string()),
+                    &command.args,
+                    &command.env.clone().into_iter().flatten().collect(),
+                    root_dir.as_ref().map(|path| path.display().to_string()),
+                    None,
+                    Interactive::No,
                 )
-            });
+            })
+        });
+        let (path, args, env) = match remote_command {
+            Some(template) => {
+                let template = template.context("building remote agent-server command")?;
+                (template.program, template.args, template.env)
+            }
+            None => (
+                command.path.display().to_string(),
+                command.args,
+                command.env.unwrap_or_default(),
+            ),
+        };
 
         let builder = ShellBuilder::new(&Shell::System, cfg!(windows)).non_interactive();
         let mut child = builder.build_std_command(Some(path.clone()), &args);
@@ -1090,6 +1136,9 @@ impl AcpConnection {
             move |cx| defaults.observe_settings(agent_id, cx)
         });
 
+        let supports_external_steer =
+            acp_thread::external_steer_capability_from_meta(&response.meta);
+
         Ok(Self {
             id: agent_id,
             auth_methods,
@@ -1100,6 +1149,7 @@ impl AcpConnection {
             sessions,
             pending_sessions: Rc::new(RefCell::new(HashMap::default())),
             agent_capabilities: response.agent_capabilities,
+            supports_external_steer,
             request_elicitations,
             defaults,
             session_list,
@@ -1142,6 +1192,7 @@ impl AcpConnection {
             auth_methods: vec![],
             agent_server_store,
             agent_capabilities,
+            supports_external_steer: false,
             request_elicitations,
             defaults,
             child: None,
@@ -1946,6 +1997,19 @@ impl AgentConnection for AcpConnection {
                 .block_task()
                 .await?;
             Ok(())
+        })
+    }
+
+    fn session_steer(
+        &self,
+        session_id: &acp::SessionId,
+        _cx: &App,
+    ) -> Option<Rc<dyn AgentSessionSteer>> {
+        self.supports_external_steer.then(|| {
+            Rc::new(AcpSessionSteer {
+                connection: self.connection.clone(),
+                session_id: session_id.clone(),
+            }) as Rc<dyn AgentSessionSteer>
         })
     }
 

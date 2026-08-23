@@ -13,6 +13,8 @@ pub struct QueueEntry {
     /// instead of waiting for generation to fully complete. Only the front
     /// entry's value matters, since messages are delivered in FIFO order.
     pub steer: bool,
+    pub steer_request_id: ClientUserMessageId,
+    pub steer_pending: bool,
     pub editor: Entity<MessageEditor>,
     pub _subscription: Subscription,
 }
@@ -76,8 +78,41 @@ impl MessageQueue {
 
     pub fn toggle_steer(&mut self, id: QueueEntryId) {
         if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) {
+            if entry.steer_pending {
+                return;
+            }
             entry.steer = !entry.steer;
         }
+    }
+
+    pub fn begin_external_steer(
+        &mut self,
+        id: QueueEntryId,
+    ) -> Option<(Vec<acp::ContentBlock>, ClientUserMessageId)> {
+        let entry = self.entries.front_mut()?;
+        if entry.id != id || !entry.steer || entry.steer_pending {
+            return None;
+        }
+        entry.steer_pending = true;
+        Some((entry.content.clone(), entry.steer_request_id.clone()))
+    }
+
+    pub fn finish_external_steer(
+        &mut self,
+        id: QueueEntryId,
+        accepted: bool,
+    ) -> Option<QueueEntry> {
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) else {
+            return None;
+        };
+        if !entry.steer_pending {
+            return None;
+        }
+        entry.steer_pending = false;
+        if accepted {
+            return self.remove(id);
+        }
+        None
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &QueueEntry> {
@@ -147,6 +182,13 @@ impl MessageQueue {
     /// Handles a generation Stopped event, returning the entry to auto-send,
     /// if any.
     pub fn on_generation_stopped(&mut self, is_first_editor_focused: bool) -> Option<QueueEntry> {
+        if self
+            .entries
+            .front()
+            .is_some_and(|entry| entry.steer_pending)
+        {
+            return None;
+        }
         match self.processing_state {
             ProcessingState::AbsorbingCancel => {
                 // This Stopped event came from a cancellation we initiated

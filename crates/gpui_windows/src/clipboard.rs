@@ -338,13 +338,14 @@ struct ClipboardGuard;
 
 impl ClipboardGuard {
     fn open() -> Option<Self> {
-        match unsafe { OpenClipboard(None) } {
-            Ok(()) => Some(Self),
-            Err(e) => {
-                log::error!("Failed to open clipboard: {e}");
-                None
+        for attempt in 0..5 {
+            if unsafe { OpenClipboard(None) }.is_ok() {
+                return Some(Self);
             }
+            std::thread::sleep(std::time::Duration::from_millis(10 * (1 << attempt)));
         }
+        log::warn!("Failed to open clipboard after 5 retry attempts");
+        None
     }
 }
 

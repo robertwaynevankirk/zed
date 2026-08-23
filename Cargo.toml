@@ -538,6 +538,7 @@ async-pipe = { git = "https://github.com/zed-industries/async-pipe-rs", rev = "8
 # `unstable` is required to compile async-tar's Windows symlink support.
 async-process = "2.5.0"
 async-recursion = "1.0.0"
+async-signal = "0.2"
 async-std = { version = "1.12", features = ["unstable"] }
 async-tar = { git = "https://github.com/zed-industries/async-tar", rev = "bd3ad6f89df9a9da7a8535958756d6bf465936a0" }
 async-task = "4.7"
@@ -1065,9 +1066,29 @@ zed = { codegen-units = 16 }
 
 [profile.release-fast]
 inherits = "release"
-debug = "full"
+debug = "line-tables-only"
 lto = false
-codegen-units = 16
+codegen-units = 22
+split-debuginfo = "unpacked"
+incremental = true
+opt-level = 3
+panic = "abort"
+
+[profile.release-fast.build-override]
+opt-level = 3
+codegen-units = 22
+
+[profile.release-fast.package]
+zed = { codegen-units = 22 }
+syn = { opt-level = 3, codegen-units = 22 }
+quote = { opt-level = 3, codegen-units = 22 }
+proc-macro2 = { opt-level = 3, codegen-units = 22 }
+gpui_macros = { opt-level = 3, codegen-units = 22 }
+derive_refineable = { opt-level = 3, codegen-units = 22 }
+tree-sitter = { opt-level = 3, codegen-units = 22 }
+wasmtime = { opt-level = 3, codegen-units = 22 }
+cranelift-codegen = { opt-level = 3, codegen-units = 22 }
+serde_json = { opt-level = 3, codegen-units = 22 }
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "allow" }

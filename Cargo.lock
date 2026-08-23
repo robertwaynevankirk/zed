@@ -14940,6 +14940,7 @@ dependencies = [
  "anyhow",
  "askpass",
  "async-channel 2.5.0",
+ "async-signal",
  "cargo_toml",
  "clap",
  "client",

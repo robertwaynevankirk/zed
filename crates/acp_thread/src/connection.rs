@@ -21,6 +21,19 @@ impl ClientUserMessageId {
     pub fn new() -> Self {
         Self(Uuid::new_v4().to_string().into())
     }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_ref()
+    }
+}
+
+pub const EXTERNAL_STEER_CAPABILITY_META_KEY: &str = "opencode.delivery.steer";
+
+pub fn external_steer_capability_from_meta(meta: &Option<acp::Meta>) -> bool {
+    meta.as_ref()
+        .and_then(|meta| meta.get(EXTERNAL_STEER_CAPABILITY_META_KEY))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
@@ -192,6 +205,16 @@ pub trait AgentConnection {
         None
     }
 
+    /// Returns a capability for agents that can admit a message into a running session
+    /// without cancelling the current prompt.
+    fn session_steer(
+        &self,
+        _session_id: &acp::SessionId,
+        _cx: &App,
+    ) -> Option<Rc<dyn AgentSessionSteer>> {
+        None
+    }
+
     fn prompt(&self, params: acp::PromptRequest, cx: &mut App)
     -> Task<Result<acp::PromptResponse>>;
 
@@ -280,6 +303,21 @@ pub trait AgentSessionClientUserMessageIds {
         params: acp::PromptRequest,
         cx: &mut App,
     ) -> Task<Result<acp::PromptResponse>>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSessionSteerResponse {
+    pub accepted: bool,
+    pub reason: Option<String>,
+}
+
+pub trait AgentSessionSteer {
+    fn run(
+        &self,
+        prompt: Vec<acp::ContentBlock>,
+        request_id: ClientUserMessageId,
+        cx: &mut App,
+    ) -> Task<Result<AgentSessionSteerResponse>>;
 }
 
 pub trait AgentSessionRetry {
@@ -755,12 +793,16 @@ mod test_support {
     #[derive(Clone)]
     pub struct StubAgentConnection {
         sessions: Arc<Mutex<HashMap<acp::SessionId, Session>>>,
+        load_session_calls: Arc<Mutex<Vec<acp::SessionId>>>,
         permission_requests: HashMap<acp::ToolCallId, PermissionOptions>,
         next_prompt_updates: Arc<Mutex<Vec<acp::SessionUpdate>>>,
         supports_load_session: bool,
         supports_session_additional_directories: bool,
         agent_id: AgentId,
         telemetry_id: SharedString,
+        session_steer_response: Option<AgentSessionSteerResponse>,
+        steer_requests: Arc<Mutex<Vec<Vec<acp::ContentBlock>>>>,
+        cancel_count: Arc<AtomicUsize>,
     }
 
     struct Session {
@@ -780,15 +822,23 @@ mod test_support {
                 next_prompt_updates: Default::default(),
                 permission_requests: HashMap::default(),
                 sessions: Arc::default(),
+                load_session_calls: Arc::default(),
                 supports_load_session: false,
                 supports_session_additional_directories: false,
                 agent_id: AgentId::new("stub"),
                 telemetry_id: "stub".into(),
+                session_steer_response: None,
+                steer_requests: Arc::default(),
+                cancel_count: Arc::default(),
             }
         }
 
         pub fn set_next_prompt_updates(&self, updates: Vec<acp::SessionUpdate>) {
             *self.next_prompt_updates.lock() = updates;
+        }
+
+        pub fn load_session_calls(&self) -> Vec<acp::SessionId> {
+            self.load_session_calls.lock().clone()
         }
 
         pub fn with_permission_requests(
@@ -820,6 +870,19 @@ mod test_support {
         pub fn with_telemetry_id(mut self, telemetry_id: SharedString) -> Self {
             self.telemetry_id = telemetry_id;
             self
+        }
+
+        pub fn with_session_steer_response(mut self, response: AgentSessionSteerResponse) -> Self {
+            self.session_steer_response = Some(response);
+            self
+        }
+
+        pub fn steer_requests(&self) -> Vec<Vec<acp::ContentBlock>> {
+            self.steer_requests.lock().clone()
+        }
+
+        pub fn cancel_count(&self) -> usize {
+            self.cancel_count.load(Ordering::SeqCst)
         }
 
         fn create_session(
@@ -945,6 +1008,7 @@ mod test_support {
                 return Task::ready(Err(anyhow::Error::msg("Loading sessions is not supported")));
             }
 
+            self.load_session_calls.lock().push(session_id.clone());
             let thread = self.create_session(session_id, project, work_dirs, title, cx);
             Task::ready(Ok(thread))
         }
@@ -1024,7 +1088,19 @@ mod test_support {
             }))
         }
 
+        fn session_steer(
+            &self,
+            _session_id: &acp::SessionId,
+            _cx: &App,
+        ) -> Option<Rc<dyn AgentSessionSteer>> {
+            Some(Rc::new(StubAgentSessionSteer {
+                response: self.session_steer_response.clone()?,
+                requests: self.steer_requests.clone(),
+            }))
+        }
+
         fn cancel(&self, session_id: &acp::SessionId, _cx: &mut App) {
+            self.cancel_count.fetch_add(1, Ordering::SeqCst);
             if let Some(end_turn_tx) = self
                 .sessions
                 .lock()
@@ -1055,6 +1131,23 @@ mod test_support {
 
         fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
             self
+        }
+    }
+
+    struct StubAgentSessionSteer {
+        response: AgentSessionSteerResponse,
+        requests: Arc<Mutex<Vec<Vec<acp::ContentBlock>>>>,
+    }
+
+    impl AgentSessionSteer for StubAgentSessionSteer {
+        fn run(
+            &self,
+            prompt: Vec<acp::ContentBlock>,
+            _request_id: ClientUserMessageId,
+            _cx: &mut App,
+        ) -> Task<Result<AgentSessionSteerResponse>> {
+            self.requests.lock().push(prompt);
+            Task::ready(Ok(self.response.clone()))
         }
     }
 

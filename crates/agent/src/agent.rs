@@ -6491,8 +6491,8 @@ mod internal_tests {
             let usage = thread
                 .token_usage()
                 .expect("token usage should be restored after reload");
-            assert_eq!(usage.input_tokens, 150);
-            assert_eq!(usage.output_tokens, 75);
+            assert_eq!(usage.input_tokens, Some(150));
+            assert_eq!(usage.output_tokens, Some(75));
         });
 
         // Ensure scroll position survived the round-trip.

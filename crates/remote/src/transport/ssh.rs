@@ -1950,7 +1950,18 @@ fn build_command_posix(
         // -t forces pseudo-TTY allocation (for interactive use)
         Interactive::Yes => args.push("-t".into()),
         // -T disables pseudo-TTY allocation (for non-interactive piped stdio)
-        Interactive::No => args.push("-T".into()),
+        Interactive::No => {
+            args.push("-T".into());
+            if !args.iter().any(|arg| arg.contains("ServerAliveInterval")) {
+                args.extend(["-o".into(), "ServerAliveInterval=15".into()]);
+            }
+            if !args.iter().any(|arg| arg.contains("ServerAliveCountMax")) {
+                args.extend(["-o".into(), "ServerAliveCountMax=3".into()]);
+            }
+            if !args.iter().any(|arg| arg.contains("TCPKeepAlive")) {
+                args.extend(["-o".into(), "TCPKeepAlive=yes".into()]);
+            }
+        }
     }
     // The destination must come after all options but before the command
     args.push(ssh_destination.into());
@@ -2045,7 +2056,18 @@ fn build_command_windows(
         // -t forces pseudo-TTY allocation (for interactive use)
         Interactive::Yes => args.push("-t".into()),
         // -T disables pseudo-TTY allocation (for non-interactive piped stdio)
-        Interactive::No => args.push("-T".into()),
+        Interactive::No => {
+            args.push("-T".into());
+            if !args.iter().any(|arg| arg.contains("ServerAliveInterval")) {
+                args.extend(["-o".into(), "ServerAliveInterval=15".into()]);
+            }
+            if !args.iter().any(|arg| arg.contains("ServerAliveCountMax")) {
+                args.extend(["-o".into(), "ServerAliveCountMax=3".into()]);
+            }
+            if !args.iter().any(|arg| arg.contains("TCPKeepAlive")) {
+                args.extend(["-o".into(), "TCPKeepAlive=yes".into()]);
+            }
+        }
     }
 
     // The destination must come after all options but before the command

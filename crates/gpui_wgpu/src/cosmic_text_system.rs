@@ -278,14 +278,13 @@ impl CosmicTextSystemState {
                 .get_font(font_id, cosmic_text::Weight::NORMAL)
                 .context("Could not load font")?;
 
-            // HACK: To let the storybook run and render Windows caption icons. We should actually do better font fallback.
-            let allowed_bad_font_names = [
-                "SegoeFluentIcons", // NOTE: Segoe fluent icons postscript name is inconsistent
-                "Segoe Fluent Icons",
-            ];
+            let is_math_or_symbol = postscript_name.to_lowercase().contains("math")
+                || postscript_name.to_lowercase().contains("symbol")
+                || postscript_name.to_lowercase().contains("icon");
 
             if font.as_swash().charmap().map('m') == 0
                 && !allowed_bad_font_names.contains(&postscript_name.as_str())
+                && !is_math_or_symbol
             {
                 self.font_system.db_mut().remove_face(font.id());
                 continue;

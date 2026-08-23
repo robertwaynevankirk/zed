@@ -3457,8 +3457,8 @@ async fn test_truncate_first_message(cx: &mut TestAppContext) {
                 used_tokens: 32_000 + 16_000,
                 max_tokens: 1_000_000,
                 max_output_tokens: None,
-                input_tokens: 32_000,
-                output_tokens: 16_000,
+                input_tokens: Some(32_000),
+                output_tokens: Some(16_000),
             })
         );
     });
@@ -3519,8 +3519,8 @@ async fn test_truncate_first_message(cx: &mut TestAppContext) {
                 used_tokens: 40_000 + 20_000,
                 max_tokens: 1_000_000,
                 max_output_tokens: None,
-                input_tokens: 40_000,
-                output_tokens: 20_000,
+                input_tokens: Some(40_000),
+                output_tokens: Some(20_000),
             })
         );
     });
@@ -3558,8 +3558,8 @@ async fn test_latest_token_usage_counts_cached_input_tokens(cx: &mut TestAppCont
                 used_tokens: 250,
                 max_tokens: 1_000_000,
                 max_output_tokens: None,
-                input_tokens: 200,
-                output_tokens: 50,
+                input_tokens: Some(200),
+                output_tokens: Some(50),
             })
         );
     });
@@ -3837,8 +3837,8 @@ async fn test_truncate_second_message(cx: &mut TestAppContext) {
                     used_tokens: 32_000 + 16_000,
                     max_tokens: 1_000_000,
                     max_output_tokens: None,
-                    input_tokens: 32_000,
-                    output_tokens: 16_000,
+                    input_tokens: Some(32_000),
+                    output_tokens: Some(16_000),
                 })
             );
         });
@@ -3894,8 +3894,8 @@ async fn test_truncate_second_message(cx: &mut TestAppContext) {
                 used_tokens: 40_000 + 20_000,
                 max_tokens: 1_000_000,
                 max_output_tokens: None,
-                input_tokens: 40_000,
-                output_tokens: 20_000,
+                input_tokens: Some(40_000),
+                output_tokens: Some(20_000),
             })
         );
     });

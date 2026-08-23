@@ -76,6 +76,14 @@ fn get_dwm_interval() -> Result<Duration> {
 
 #[inline]
 fn retrieve_duration(counts: u64, ticks_per_second: u64) -> Duration {
-    let ticks_per_microsecond = ticks_per_second / 1_000_000;
-    Duration::from_micros(counts / ticks_per_microsecond)
+    if ticks_per_second == 0 {
+        return Duration::from_millis(16);
+    }
+    if ticks_per_second >= 1_000_000 {
+        let ticks_per_microsecond = (ticks_per_second / 1_000_000).max(1);
+        Duration::from_micros(counts / ticks_per_microsecond)
+    } else {
+        let nanos = (counts as u128 * 1_000_000_000u128) / (ticks_per_second as u128);
+        Duration::from_nanos(nanos as u64)
+    }
 }

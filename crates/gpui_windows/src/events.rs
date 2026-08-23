@@ -974,8 +974,8 @@ impl WindowsWindowInner {
         let dpi = unsafe { GetDpiForWindow(handle) };
         // We do not use the OS title bar, so the default `DefWindowProcW` will only register a 1px edge for resizes
         // We need to calculate the frame thickness ourselves and do the hit test manually.
-        let frame_y = get_frame_thicknessx(dpi);
-        let frame_x = get_frame_thicknessy(dpi);
+        let frame_x = get_frame_thicknessx(dpi);
+        let frame_y = get_frame_thicknessy(dpi);
         let mut cursor_point = POINT {
             x: lparam.signed_loword().into(),
             y: lparam.signed_hiword().into(),
@@ -1641,19 +1641,20 @@ fn process_key(vkey: VIRTUAL_KEY, scan_code: u16) -> (Option<String>, bool) {
 fn parse_ime_composition_string(ctx: HIMC, comp_type: IME_COMPOSITION_STRING) -> Option<Vec<u16>> {
     unsafe {
         let string_len = ImmGetCompositionStringW(ctx, comp_type, None, 0);
-        if string_len >= 0 {
-            let mut buffer = vec![0u8; string_len as usize + 2];
-            ImmGetCompositionStringW(
+        if string_len > 0 {
+            let u16_len = string_len as usize / 2;
+            let mut buffer = vec![0u16; u16_len];
+            let read_bytes = ImmGetCompositionStringW(
                 ctx,
                 comp_type,
                 Some(buffer.as_mut_ptr() as _),
                 string_len as _,
             );
-            let wstring = std::slice::from_raw_parts::<u16>(
-                buffer.as_mut_ptr().cast::<u16>(),
-                string_len as usize / 2,
-            );
-            Some(wstring.to_vec())
+            if read_bytes >= 0 {
+                Some(buffer)
+            } else {
+                None
+            }
         } else {
             None
         }
@@ -1662,14 +1663,20 @@ fn parse_ime_composition_string(ctx: HIMC, comp_type: IME_COMPOSITION_STRING) ->
 
 #[inline]
 fn retrieve_composition_cursor_position(ctx: HIMC) -> usize {
-    unsafe { ImmGetCompositionStringW(ctx, GCS_CURSORPOS, None, 0) as usize }
+    let pos = unsafe { ImmGetCompositionStringW(ctx, GCS_CURSORPOS, None, 0) };
+    if pos < 0 {
+        0
+    } else {
+        pos as usize
+    }
 }
 
 fn should_use_ime_cursor_position(ctx: HIMC, cursor_pos: usize) -> bool {
-    let attrs_size = unsafe { ImmGetCompositionStringW(ctx, GCS_COMPATTR, None, 0) } as usize;
-    if attrs_size == 0 {
+    let attrs_len = unsafe { ImmGetCompositionStringW(ctx, GCS_COMPATTR, None, 0) };
+    if attrs_len <= 0 {
         return false;
     }
+    let attrs_size = attrs_len as usize;
 
     let mut attrs = vec![0u8; attrs_size];
     let result = unsafe {

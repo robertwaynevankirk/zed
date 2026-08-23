@@ -15,7 +15,7 @@ use windows::Win32::{
         },
         Dxgi::{
             CreateDXGIFactory2, DXGI_CREATE_FACTORY_DEBUG, DXGI_CREATE_FACTORY_FLAGS,
-            IDXGIAdapter1, IDXGIFactory6,
+            DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IDXGIAdapter1, IDXGIFactory6,
         },
     },
 };
@@ -113,7 +113,15 @@ fn get_adapter(
     D3D_FEATURE_LEVEL,
 )> {
     for adapter_index in 0.. {
-        let adapter: IDXGIAdapter1 = unsafe { dxgi_factory.EnumAdapters(adapter_index)?.cast()? };
+        let adapter: IDXGIAdapter1 = match unsafe {
+            dxgi_factory.EnumAdapterByGpuPreference(adapter_index, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)
+        } {
+            Ok(adapter) => adapter.cast()?,
+            Err(_) => match unsafe { dxgi_factory.EnumAdapters(adapter_index) } {
+                Ok(adapter) => adapter.cast()?,
+                Err(_) => break,
+            },
+        };
         if let Ok(desc) = unsafe { adapter.GetDesc1() } {
             let gpu_name = String::from_utf16_lossy(&desc.Description)
                 .trim_matches(char::from(0))

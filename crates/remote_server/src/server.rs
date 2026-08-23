@@ -9,6 +9,7 @@ pub mod windows;
 pub use headless_project::{HeadlessAppState, HeadlessProject};
 
 use anyhow::{Context as _, Result, anyhow};
+use async_signal::{Signal, Signals};
 use clap::Subcommand;
 use client::ProxySettings;
 use collections::HashMap;
@@ -384,25 +385,117 @@ fn handle_crash_files_requests(project: &Entity<HeadlessProject>, client: &AnyPr
     );
 }
 
+pub fn sanitize_stale_sockets() {
+    sanitize_stale_sockets_in_dir(paths::remote_server_state_dir().as_path());
+}
+
+pub fn sanitize_stale_sockets_in_dir(state_dir: &Path) {
+    if !state_dir.exists() {
+        return;
+    }
+
+    log::debug!("performing stale socket sanitation in {:?}", state_dir);
+    let Ok(entries) = std::fs::read_dir(state_dir) else {
+        return;
+    };
+
+    let system = sysinfo::System::new_with_specifics(
+        sysinfo::RefreshKind::nothing().with_processes(sysinfo::ProcessRefreshKind::nothing()),
+    );
+    let current_pid = std::process::id();
+
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        if !entry_path.is_dir() {
+            continue;
+        }
+
+        let pid_file = entry_path.join("server.pid");
+        let is_running = if pid_file.exists() {
+            if let Ok(content) = std::fs::read_to_string(&pid_file) {
+                if let Ok(pid) = content.trim().parse::<u32>() {
+                    if pid == current_pid {
+                        true
+                    } else {
+                        system.process(sysinfo::Pid::from_u32(pid)).is_some()
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if !is_running {
+            log::info!(
+                "sanitizing stale server state directory: {:?}",
+                entry_path
+            );
+            for file_name in ["stdin.sock", "stdout.sock", "stderr.sock", "server.pid"] {
+                let sock_path = entry_path.join(file_name);
+                if sock_path.exists() {
+                    let _ = std::fs::remove_file(&sock_path);
+                }
+            }
+            let _ = std::fs::remove_dir(&entry_path);
+        }
+    }
+}
+
 struct ServerListeners {
     stdin: UnixListener,
     stdout: UnixListener,
     stderr: UnixListener,
+    stdin_path: PathBuf,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
 }
 
 impl ServerListeners {
     pub fn new(stdin_path: PathBuf, stdout_path: PathBuf, stderr_path: PathBuf) -> Result<Self> {
+        // Pre-bind stale socket sanitation
+        for path in [&stdin_path, &stdout_path, &stderr_path] {
+            if path.exists() {
+                log::info!("pre-bind sanitation: removing stale socket file {:?}", path);
+                let _ = std::fs::remove_file(path);
+            }
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
+
+        sanitize_stale_sockets();
+
         Ok(Self {
-            stdin: UnixListener::bind(stdin_path).context("failed to bind stdin socket")?,
-            stdout: UnixListener::bind(stdout_path).context("failed to bind stdout socket")?,
-            stderr: UnixListener::bind(stderr_path).context("failed to bind stderr socket")?,
+            stdin: UnixListener::bind(&stdin_path)
+                .with_context(|| format!("failed to bind stdin socket at {:?}", stdin_path))?,
+            stdout: UnixListener::bind(&stdout_path)
+                .with_context(|| format!("failed to bind stdout socket at {:?}", stdout_path))?,
+            stderr: UnixListener::bind(&stderr_path)
+                .with_context(|| format!("failed to bind stderr socket at {:?}", stderr_path))?,
+            stdin_path,
+            stdout_path,
+            stderr_path,
         })
+    }
+}
+
+impl Drop for ServerListeners {
+    fn drop(&mut self) {
+        log::info!("ServerListeners dropped, cleaning up unix socket files");
+        let _ = std::fs::remove_file(&self.stdin_path);
+        let _ = std::fs::remove_file(&self.stdout_path);
+        let _ = std::fs::remove_file(&self.stderr_path);
     }
 }
 
 fn start_server(
     listeners: ServerListeners,
     log_rx: Receiver<Vec<u8>>,
+    signals_res: Result<Signals, std::io::Error>,
     cx: &mut App,
     is_wsl_interop: bool,
 ) -> AnyProtoClient {
@@ -412,12 +505,53 @@ fn start_server(
     let (incoming_tx, incoming_rx) = mpsc::unbounded::<Envelope>();
     let (outgoing_tx, mut outgoing_rx) = mpsc::unbounded::<Envelope>();
     let (app_quit_tx, mut app_quit_rx) = mpsc::unbounded::<()>();
+    let (signal_tx, mut signal_rx) = mpsc::unbounded::<Signal>();
 
     cx.on_app_quit(move |_| {
         let mut app_quit_tx = app_quit_tx.clone();
         async move {
             log::info!("app quitting. sending signal to server main loop");
             app_quit_tx.send(()).await.ok();
+        }
+    })
+    .detach();
+
+    cx.background_spawn(async move {
+        match signals_res {
+            Ok(mut signals) => {
+                while let Some(signal) = signals.next().await {
+                    match signal {
+                        Ok(sig) => {
+                            log::info!("received signal {:?}, initiating graceful shutdown", sig);
+                            signal_tx.unbounded_send(sig).ok();
+
+                            let sig_num = match sig {
+                                Signal::Int => 2,
+                                Signal::Term => 15,
+                                Signal::Hup => 1,
+                                _ => 15,
+                            };
+                            smol::spawn(async move {
+                                if let Some(Ok(second_sig)) = signals.next().await {
+                                    log::warn!(
+                                        "received second signal {:?}, forcing immediate exit",
+                                        second_sig
+                                    );
+                                    std::process::exit(128 + sig_num);
+                                }
+                            })
+                            .detach();
+                            break;
+                        }
+                        Err(err) => {
+                            log::error!("error receiving signal: {:?}", err);
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                log::error!("failed to register signal handlers: {:?}", err);
+            }
         }
     })
     .detach();
@@ -454,6 +588,14 @@ fn start_server(
                     log::info!("app quit requested");
                     break;
                 }
+                sig = signal_rx.next().fuse() => {
+                    log::info!("signal {:?} received in accept loop, shutting down", sig);
+                    cx.update(|cx| {
+                        cx.shutdown();
+                        cx.quit();
+                    });
+                    break;
+                }
             };
 
             let Ok((mut stdin_stream, mut stdout_stream, mut stderr_stream)) = result else {
@@ -474,7 +616,7 @@ fn start_server(
                             }
                         }
                         Err(error) => {
-                            log::warn!("stdin read failed: {error:?}");
+                            log::warn!("client disconnected from stdin stream: {error:?}");
                             break;
                         }
                     }
@@ -482,15 +624,23 @@ fn start_server(
             }).detach();
 
             loop {
-
                 select_biased! {
                     _ = app_quit_rx.next().fuse() => {
                         return anyhow::Ok(());
                     }
 
+                    sig = signal_rx.next().fuse() => {
+                        log::info!("signal {:?} received during connection, shutting down", sig);
+                        cx.update(|cx| {
+                            cx.shutdown();
+                            cx.quit();
+                        });
+                        return anyhow::Ok(());
+                    }
+
                     stdin_message = stdin_msg_rx.next().fuse() => {
                         let Some(message) = stdin_message else {
-                            log::warn!("error reading message on stdin, dropping connection.");
+                            log::warn!("client connection closed (EOF on stdin), unbinding connection streams.");
                             break;
                         };
                         if let Err(error) = incoming_tx.unbounded_send(message) {
@@ -508,11 +658,11 @@ fn start_server(
                         if let Err(error) =
                             write_message(&mut stdout_stream, &mut output_buffer, message).await
                         {
-                            log::error!("failed to write stdout message: {:?}", error);
+                            log::error!("failed to write stdout message: {:?}, client disconnected", error);
                             break;
                         }
                         if let Err(error) = stdout_stream.flush().await {
-                            log::error!("failed to flush stdout message: {:?}", error);
+                            log::error!("failed to flush stdout message: {:?}, client disconnected", error);
                             break;
                         }
                     }
@@ -520,17 +670,18 @@ fn start_server(
                     log_message = log_rx.recv().fuse() => {
                         if let Ok(log_message) = log_message {
                             if let Err(error) = stderr_stream.write_all(&log_message).await {
-                                log::error!("failed to write log message to stderr: {:?}", error);
+                                log::error!("failed to write log message to stderr: {:?}, client disconnected", error);
                                 break;
                             }
                             if let Err(error) = stderr_stream.flush().await {
-                                log::error!("failed to flush stderr stream: {:?}", error);
+                                log::error!("failed to flush stderr stream: {:?}, client disconnected", error);
                                 break;
                             }
                         }
                     }
                 }
             }
+            log::info!("client session disconnected, cleaned up connection streams, returning to accept loop");
         }
         anyhow::Ok(())
     })
@@ -557,6 +708,23 @@ fn init_paths() -> anyhow::Result<()> {
     Ok(())
 }
 
+struct ServerStateGuard {
+    pid_file: PathBuf,
+    stdin_socket: PathBuf,
+    stdout_socket: PathBuf,
+    stderr_socket: PathBuf,
+}
+
+impl Drop for ServerStateGuard {
+    fn drop(&mut self) {
+        log::info!("ServerStateGuard cleaning up server state files");
+        let _ = std::fs::remove_file(&self.pid_file);
+        let _ = std::fs::remove_file(&self.stdin_socket);
+        let _ = std::fs::remove_file(&self.stdout_socket);
+        let _ = std::fs::remove_file(&self.stderr_socket);
+    }
+}
+
 pub fn execute_run(
     log_file: PathBuf,
     pid_file: PathBuf,
@@ -565,6 +733,19 @@ pub fn execute_run(
     stderr_socket: PathBuf,
 ) -> Result<()> {
     init_paths()?;
+    sanitize_stale_sockets();
+
+    #[cfg(unix)]
+    let signals = Signals::new([Signal::Int, Signal::Term, Signal::Hup]);
+    #[cfg(not(unix))]
+    let signals = Signals::new([Signal::Int, Signal::Term]);
+
+    let _state_guard = ServerStateGuard {
+        pid_file: pid_file.clone(),
+        stdin_socket: stdin_socket.clone(),
+        stdout_socket: stdout_socket.clone(),
+        stderr_socket: stderr_socket.clone(),
+    };
 
     let startup_time = Instant::now();
     let app = gpui_platform::headless();
@@ -663,7 +844,7 @@ pub fn execute_run(
         };
 
         log::info!("gpui app started, initializing server");
-        let session = start_server(listeners, log_rx, cx, is_wsl_interop);
+        let session = start_server(listeners, log_rx, signals, cx, is_wsl_interop);
         init_telemetry_forwarding(session.clone(), cx);
         trusted_worktrees::init(HashMap::default(), cx);
 
@@ -844,6 +1025,7 @@ pub(crate) fn execute_proxy(
     is_reconnecting: bool,
 ) -> Result<(), ExecuteProxyError> {
     init_logging_proxy();
+    sanitize_stale_sockets();
 
     let server_paths = ServerPaths::new(&identifier)?;
 
@@ -911,6 +1093,21 @@ pub(crate) fn execute_proxy(
         }
     };
 
+    #[cfg(unix)]
+    let signals = Signals::new([Signal::Int, Signal::Term, Signal::Hup]).ok();
+    #[cfg(not(unix))]
+    let signals = Signals::new([Signal::Int, Signal::Term]).ok();
+
+    let signal_task = smol::spawn(async move {
+        if let Some(mut signals) = signals {
+            if let Some(Ok(sig)) = signals.next().await {
+                log::info!("proxy received signal {:?}, terminating proxy session", sig);
+                return;
+            }
+        }
+        futures::future::pending::<()>().await
+    });
+
     let stdin_task = smol::spawn(async move {
         let stdin = smol::Unblock::new(std::io::stdin());
         let stream = UnixStream::connect(&server_paths.stdin_socket)
@@ -972,6 +1169,10 @@ pub(crate) fn execute_proxy(
             result = stdin_task.fuse() => result.map_err(ExecuteProxyError::StdinTask),
             result = stdout_task.fuse() => result.map_err(ExecuteProxyError::StdoutTask),
             result = stderr_task.fuse() => result.map_err(ExecuteProxyError::StderrTask),
+            _ = signal_task.fuse() => {
+                log::info!("proxy exiting cleanly due to signal");
+                Ok(())
+            }
         }
     }) {
         log::error!("encountered error while forwarding messages: {forwarding_result:#}",);
@@ -1173,6 +1374,9 @@ fn check_pid_file(path: &Path) -> Result<Option<u32>, CheckPidError> {
 }
 
 fn write_pid_file(path: &Path, pid: u32) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     if path.exists() {
         std::fs::remove_file(path)?;
     }
@@ -1427,5 +1631,103 @@ mod tests {
             std::fs::read(&log_path).expect("read active log"),
             new_contents
         );
+    }
+
+    #[test]
+    fn stale_socket_sanitation_removes_dead_server_files_and_preserves_running() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let root = temp_dir.path();
+
+        // 1. Dead server directory with non-existent PID (e.g. PID 9999999)
+        let dead_dir = root.join("dead-session-1");
+        std::fs::create_dir_all(&dead_dir).expect("create dead dir");
+        std::fs::write(dead_dir.join("server.pid"), "9999999\n").expect("write dead pid");
+        std::fs::write(dead_dir.join("stdin.sock"), "dummy socket").expect("write dead stdin");
+        std::fs::write(dead_dir.join("stdout.sock"), "dummy socket").expect("write dead stdout");
+        std::fs::write(dead_dir.join("stderr.sock"), "dummy socket").expect("write dead stderr");
+
+        // 2. Dead server directory with missing PID file
+        let no_pid_dir = root.join("no-pid-session-2");
+        std::fs::create_dir_all(&no_pid_dir).expect("create no-pid dir");
+        std::fs::write(no_pid_dir.join("stdin.sock"), "dummy socket").expect("write no-pid stdin");
+
+        // 3. Live server directory with current process PID
+        let current_pid = std::process::id();
+        let live_dir = root.join("live-session-3");
+        std::fs::create_dir_all(&live_dir).expect("create live dir");
+        std::fs::write(live_dir.join("server.pid"), format!("{current_pid}\n")).expect("write live pid");
+        std::fs::write(live_dir.join("stdin.sock"), "live socket").expect("write live stdin");
+        std::fs::write(live_dir.join("stdout.sock"), "live socket").expect("write live stdout");
+        std::fs::write(live_dir.join("stderr.sock"), "live socket").expect("write live stderr");
+
+        // Run sanitation
+        sanitize_stale_sockets_in_dir(root);
+
+        // Verify dead dirs are purged
+        assert!(!dead_dir.exists(), "dead session directory should be removed");
+        assert!(!no_pid_dir.exists(), "no-pid session directory should be removed");
+
+        // Verify live dir is preserved
+        assert!(live_dir.exists(), "live session directory should be preserved");
+        assert!(live_dir.join("server.pid").exists(), "live server.pid must remain");
+        assert!(live_dir.join("stdin.sock").exists(), "live stdin.sock must remain");
+        assert!(live_dir.join("stdout.sock").exists(), "live stdout.sock must remain");
+        assert!(live_dir.join("stderr.sock").exists(), "live stderr.sock must remain");
+    }
+
+    #[test]
+    fn server_listeners_pre_bind_sanitation_cleans_existing_files() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let stdin_path = temp_dir.path().join("stdin.sock");
+        let stdout_path = temp_dir.path().join("stdout.sock");
+        let stderr_path = temp_dir.path().join("stderr.sock");
+
+        // Create stale files at socket paths
+        std::fs::write(&stdin_path, "stale").expect("write stale stdin");
+        std::fs::write(&stdout_path, "stale").expect("write stale stdout");
+        std::fs::write(&stderr_path, "stale").expect("write stale stderr");
+
+        // Binding should sanitize stale files and succeed
+        let listeners = ServerListeners::new(stdin_path.clone(), stdout_path.clone(), stderr_path.clone())
+            .expect("ServerListeners::new should succeed despite existing files");
+
+        assert!(stdin_path.exists());
+        assert!(stdout_path.exists());
+        assert!(stderr_path.exists());
+
+        // Dropping should remove socket files
+        drop(listeners);
+
+        assert!(!stdin_path.exists(), "stdin.sock should be removed on drop");
+        assert!(!stdout_path.exists(), "stdout.sock should be removed on drop");
+        assert!(!stderr_path.exists(), "stderr.sock should be removed on drop");
+    }
+
+    #[test]
+    fn server_state_guard_drop_cleans_up_all_state_files() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let pid_file = temp_dir.path().join("server.pid");
+        let stdin_socket = temp_dir.path().join("stdin.sock");
+        let stdout_socket = temp_dir.path().join("stdout.sock");
+        let stderr_socket = temp_dir.path().join("stderr.sock");
+
+        std::fs::write(&pid_file, "12345").expect("write pid");
+        std::fs::write(&stdin_socket, "socket").expect("write stdin");
+        std::fs::write(&stdout_socket, "socket").expect("write stdout");
+        std::fs::write(&stderr_socket, "socket").expect("write stderr");
+
+        let guard = ServerStateGuard {
+            pid_file: pid_file.clone(),
+            stdin_socket: stdin_socket.clone(),
+            stdout_socket: stdout_socket.clone(),
+            stderr_socket: stderr_socket.clone(),
+        };
+
+        drop(guard);
+
+        assert!(!pid_file.exists(), "server.pid should be removed on guard drop");
+        assert!(!stdin_socket.exists(), "stdin.sock should be removed on guard drop");
+        assert!(!stdout_socket.exists(), "stdout.sock should be removed on guard drop");
+        assert!(!stderr_socket.exists(), "stderr.sock should be removed on guard drop");
     }
 }

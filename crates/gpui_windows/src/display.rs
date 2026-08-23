@@ -199,6 +199,6 @@ fn get_scale_factor_for_monitor(monitor: HMONITOR) -> Result<f32> {
     let mut dpi_x = 0;
     let mut dpi_y = 0;
     unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) }?;
-    assert_eq!(dpi_x, dpi_y);
-    Ok(dpi_x as f32 / USER_DEFAULT_SCREEN_DPI as f32)
+    let dpi = if dpi_x > 0 { dpi_x } else if dpi_y > 0 { dpi_y } else { USER_DEFAULT_SCREEN_DPI };
+    Ok(dpi as f32 / USER_DEFAULT_SCREEN_DPI as f32)
 }

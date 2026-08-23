@@ -13,11 +13,20 @@ pub fn message_len_from_buffer(buffer: &[u8]) -> MessageLen {
     MessageLen::from_le_bytes(buffer.try_into().unwrap())
 }
 
+pub const MAX_REMOTE_MESSAGE_LEN: MessageLen = 64 * 1024 * 1024;
+
 pub async fn read_message_with_len<S: AsyncRead + Unpin>(
     stream: &mut S,
     buffer: &mut Vec<u8>,
     message_len: MessageLen,
 ) -> Result<Envelope> {
+    if message_len > MAX_REMOTE_MESSAGE_LEN {
+        anyhow::bail!(
+            "Remote message length {} exceeds maximum allowed {}",
+            message_len,
+            MAX_REMOTE_MESSAGE_LEN
+        );
+    }
     buffer.resize(message_len as usize, 0);
     stream.read_exact(buffer).await?;
     Ok(Envelope::decode(buffer.as_slice())?)

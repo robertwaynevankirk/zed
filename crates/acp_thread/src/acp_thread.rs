@@ -272,9 +272,9 @@ pub fn sandbox_not_applied_from_meta(meta: &Option<acp::Meta>) -> Option<Sandbox
         .and_then(|v| serde_json::from_value(v.clone()).ok())
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SubagentSessionInfo {
-    /// The session id of the subagent sessiont that was spawned
+    /// The session id of the subagent session that was spawned
     pub session_id: acp::SessionId,
     /// The index of the message of the start of the "turn" run by this tool call
     pub message_start_index: usize,
@@ -288,6 +288,52 @@ pub fn subagent_session_info_from_meta(meta: &Option<acp::Meta>) -> Option<Subag
     meta.as_ref()
         .and_then(|m| m.get(SUBAGENT_SESSION_INFO_META_KEY))
         .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .filter(|info: &SubagentSessionInfo| !info.session_id.0.trim().is_empty())
+}
+
+/// Title suffix an external agent appends to the parent task tool-call title to
+/// signal the child session is blocked on a permission decision. Not standard
+/// ACP; a best-effort hint for clients that cannot load the child session.
+pub const SUBAGENT_BLOCKED_ON_PERMISSION_SUFFIX: &str = "(blocked on permission)";
+
+/// Title suffix an external agent appends to signal the child session is blocked
+/// on an elicitation (question) response.
+pub const SUBAGENT_BLOCKED_ON_QUESTION_SUFFIX: &str = "(blocked on question)";
+
+/// The kind of block an external agent reports through a parent task title
+/// suffix (see [`split_subagent_blocked_suffix`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubagentBlockedReason {
+    Permission,
+    Question,
+}
+
+/// Splits a trailing blocked-state suffix from a parent task tool-call label.
+///
+/// External agents that cannot rely on a client loading the child session
+/// append a `(blocked on …)` suffix to the parent tool-call title. This
+/// returns the label with the suffix and any trailing whitespace it clung to
+/// removed, plus the detected reason. Labels without a known suffix are
+/// returned unchanged with `None`.
+pub fn split_subagent_blocked_suffix(
+    label: &str,
+) -> (SharedString, Option<SubagentBlockedReason>) {
+    let trimmed = label.trim_end();
+    for (suffix, reason) in [
+        (
+            SUBAGENT_BLOCKED_ON_PERMISSION_SUFFIX,
+            SubagentBlockedReason::Permission,
+        ),
+        (
+            SUBAGENT_BLOCKED_ON_QUESTION_SUFFIX,
+            SubagentBlockedReason::Question,
+        ),
+    ] {
+        if let Some(stripped) = trimmed.strip_suffix(suffix) {
+            return (stripped.trim_end().to_string().into(), Some(reason));
+        }
+    }
+    (SharedString::from(label.to_string()), None)
 }
 
 #[derive(Debug)]
@@ -2014,8 +2060,8 @@ impl PlanEntry {
 pub struct TokenUsage {
     pub max_tokens: u64,
     pub used_tokens: u64,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
     pub max_output_tokens: Option<u64>,
 }
 
@@ -2333,6 +2379,10 @@ impl AcpThread {
 
     pub fn parent_session_id(&self) -> Option<&acp::SessionId> {
         self.parent_session_id.as_ref()
+    }
+
+    pub fn set_parent_session_id(&mut self, parent_session_id: acp::SessionId) {
+        self.parent_session_id = Some(parent_session_id);
     }
 
     pub fn prompt_capabilities(&self) -> acp::PromptCapabilities {
@@ -3154,10 +3204,18 @@ impl AcpThread {
         let AgentThreadEntry::ToolCall(call) = &mut self.entries[ix] else {
             unreachable!()
         };
+        let previous_subagent_session_id = call
+            .subagent_session_info
+            .as_ref()
+            .map(|info| info.session_id.clone());
 
+        let mut location_update_id = None;
         match update {
             ToolCallUpdate::UpdateFields(update) => {
                 let location_updated = update.fields.locations.is_some();
+                if location_updated {
+                    location_update_id = Some(update.tool_call_id.clone());
+                }
                 call.update_fields(
                     update.fields,
                     update.meta,
@@ -3166,9 +3224,6 @@ impl AcpThread {
                     &self.terminals,
                     cx,
                 )?;
-                if location_updated {
-                    self.resolve_locations(update.tool_call_id, cx);
-                }
             }
             ToolCallUpdate::UpdateDiff(update) => {
                 call.content.clear();
@@ -3181,7 +3236,18 @@ impl AcpThread {
             }
         }
 
+        let subagent_session_id = call
+            .subagent_session_info
+            .as_ref()
+            .map(|info| info.session_id.clone())
+            .filter(|session_id| previous_subagent_session_id.as_ref() != Some(session_id));
         cx.emit(AcpThreadEvent::EntryUpdated(ix));
+        if let Some(session_id) = subagent_session_id {
+            cx.emit(AcpThreadEvent::SubagentSpawned(session_id));
+        }
+        if let Some(id) = location_update_id {
+            self.resolve_locations(id, cx);
+        }
 
         Ok(())
     }
@@ -3229,6 +3295,10 @@ impl AcpThread {
             let AgentThreadEntry::ToolCall(call) = &mut self.entries[ix] else {
                 unreachable!()
             };
+            let previous_subagent_session_id = call
+                .subagent_session_info
+                .as_ref()
+                .map(|info| info.session_id.clone());
 
             call.update_fields(
                 update.fields,
@@ -3241,6 +3311,14 @@ impl AcpThread {
             call.update_status(status);
 
             cx.emit(AcpThreadEvent::EntryUpdated(ix));
+            if let Some(session_id) = call
+                .subagent_session_info
+                .as_ref()
+                .map(|info| info.session_id.clone())
+                .filter(|session_id| previous_subagent_session_id.as_ref() != Some(session_id))
+            {
+                cx.emit(AcpThreadEvent::SubagentSpawned(session_id));
+            }
         } else {
             let call = ToolCall::from_acp(
                 update.try_into()?,
@@ -3250,7 +3328,14 @@ impl AcpThread {
                 &self.terminals,
                 cx,
             )?;
+            let subagent_session_id = call
+                .subagent_session_info
+                .as_ref()
+                .map(|info| info.session_id.clone());
             self.push_entry(AgentThreadEntry::ToolCall(call), cx);
+            if let Some(session_id) = subagent_session_id {
+                cx.emit(AcpThreadEvent::SubagentSpawned(session_id));
+            }
         };
 
         self.resolve_locations(id, cx);
@@ -3647,6 +3732,32 @@ impl AcpThread {
         self.send_inner(message, false, cx)
     }
 
+    pub fn record_steered_user_message(
+        &mut self,
+        message: Vec<acp::ContentBlock>,
+        client_id: ClientUserMessageId,
+        cx: &mut Context<Self>,
+    ) {
+        let block = ContentBlock::new_combined(
+            message.clone(),
+            self.project.read(cx).languages().clone(),
+            self.project.read(cx).path_style(cx),
+            cx,
+        );
+        self.push_entry(
+            AgentThreadEntry::UserMessage(UserMessage {
+                protocol_id: None,
+                client_id: Some(client_id),
+                is_optimistic: true,
+                content: block,
+                chunks: message,
+                checkpoint: None,
+                indented: false,
+            }),
+            cx,
+        );
+    }
+
     fn send_inner(
         &mut self,
         message: Vec<acp::ContentBlock>,
@@ -3801,8 +3912,9 @@ impl AcpThread {
 
                             let exceeded_max_output_tokens =
                                 this.token_usage.as_ref().is_some_and(|u| {
-                                    u.max_output_tokens
-                                        .is_some_and(|max| u.output_tokens >= max)
+                                    u.max_output_tokens.is_some_and(|max| {
+                                        u.output_tokens.is_some_and(|output| output >= max)
+                                    })
                                 });
 
                             if exceeded_max_output_tokens {
@@ -3868,8 +3980,8 @@ impl AcpThread {
                             && let Some(response_usage) = &r.usage
                         {
                             let usage = this.token_usage.get_or_insert_with(Default::default);
-                            usage.input_tokens = response_usage.input_tokens;
-                            usage.output_tokens = response_usage.output_tokens;
+                            usage.input_tokens = Some(response_usage.input_tokens);
+                            usage.output_tokens = Some(response_usage.output_tokens);
                             cx.emit(AcpThreadEvent::TokenUsageUpdated);
                         }
 
@@ -4805,6 +4917,147 @@ mod tests {
         let unknown =
             acp::Meta::from_iter([(COMMAND_CATEGORY_META_KEY.into(), "future-category".into())]);
         assert_eq!(command_category_from_meta(&Some(unknown)), None);
+    }
+
+    #[test]
+    fn external_steer_capability_requires_boolean_true() {
+        assert!(!external_steer_capability_from_meta(&None));
+        assert!(!external_steer_capability_from_meta(&Some(
+            acp::Meta::from_iter([(EXTERNAL_STEER_CAPABILITY_META_KEY.into(), "true".into()),])
+        )));
+        assert!(!external_steer_capability_from_meta(&Some(
+            acp::Meta::from_iter([(EXTERNAL_STEER_CAPABILITY_META_KEY.into(), false.into()),])
+        )));
+        assert!(external_steer_capability_from_meta(&Some(
+            acp::Meta::from_iter([(EXTERNAL_STEER_CAPABILITY_META_KEY.into(), true.into()),])
+        )));
+    }
+
+    #[test]
+    fn subagent_session_info_rejects_malformed_metadata() {
+        let valid = acp::Meta::from_iter([(
+            SUBAGENT_SESSION_INFO_META_KEY.into(),
+            json!({
+                "session_id": "child",
+                "message_start_index": 2,
+                "message_end_index": null
+            }),
+        )]);
+        assert_eq!(
+            subagent_session_info_from_meta(&Some(valid)),
+            Some(SubagentSessionInfo {
+                session_id: acp::SessionId::new("child"),
+                message_start_index: 2,
+                message_end_index: None,
+            })
+        );
+
+        for value in [
+            json!(null),
+            json!({ "session_id": "", "message_start_index": 0 }),
+            json!({ "session_id": "child" }),
+            json!({ "session_id": 1, "message_start_index": 0 }),
+        ] {
+            let meta = acp::Meta::from_iter([(SUBAGENT_SESSION_INFO_META_KEY.into(), value)]);
+            assert_eq!(subagent_session_info_from_meta(&Some(meta)), None);
+        }
+    }
+
+    #[test]
+    fn split_subagent_blocked_suffix_parses_and_strips_trailing_marker() {
+        let (label, reason) = split_subagent_blocked_suffix("Investigate parser");
+        assert_eq!(label, "Investigate parser");
+        assert_eq!(reason, None);
+
+        let (label, reason) =
+            split_subagent_blocked_suffix("Investigate parser (blocked on permission)");
+        assert_eq!(label, "Investigate parser");
+        assert_eq!(reason, Some(SubagentBlockedReason::Permission));
+
+        let (label, reason) =
+            split_subagent_blocked_suffix("Investigate parser (blocked on question)");
+        assert_eq!(label, "Investigate parser");
+        assert_eq!(reason, Some(SubagentBlockedReason::Question));
+
+        // Trailing whitespace before the suffix is trimmed from the result.
+        let (label, reason) =
+            split_subagent_blocked_suffix("Investigate parser  (blocked on permission)");
+        assert_eq!(label, "Investigate parser");
+        assert_eq!(reason, Some(SubagentBlockedReason::Permission));
+
+        // A suffix that is not at the end is left intact.
+        let (label, reason) =
+            split_subagent_blocked_suffix("(blocked on permission) early work");
+        assert_eq!(label, "(blocked on permission) early work");
+        assert_eq!(reason, None);
+
+        // A label that is only the suffix collapses to an empty title.
+        let (label, reason) = split_subagent_blocked_suffix("(blocked on permission)");
+        assert_eq!(label, "");
+        assert_eq!(reason, Some(SubagentBlockedReason::Permission));
+    }
+
+    #[gpui::test]
+    async fn test_external_subagent_metadata_emits_spawn_once(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .expect("create thread");
+        let spawned = Rc::new(RefCell::new(Vec::new()));
+        thread.update(cx, |_thread, cx| {
+            let spawned = spawned.clone();
+            cx.subscribe(&thread, move |_, _, event, _| {
+                if let AcpThreadEvent::SubagentSpawned(session_id) = event {
+                    spawned.borrow_mut().push(session_id.clone());
+                }
+            })
+            .detach();
+        });
+
+        let metadata = acp::Meta::from_iter([(
+            SUBAGENT_SESSION_INFO_META_KEY.into(),
+            json!({ "session_id": "child", "message_start_index": 0 }),
+        )]);
+        thread
+            .update(cx, |thread, cx| {
+                thread.handle_session_update(
+                    acp::SessionUpdate::ToolCall(
+                        acp::ToolCall::new("task", "Investigate parser")
+                            .kind(acp::ToolKind::Think)
+                            .status(acp::ToolCallStatus::InProgress),
+                    ),
+                    cx,
+                )?;
+                thread.handle_session_update(
+                    acp::SessionUpdate::ToolCallUpdate(
+                        acp::ToolCallUpdate::new("task", acp::ToolCallUpdateFields::new())
+                            .meta(metadata.clone()),
+                    ),
+                    cx,
+                )?;
+                thread.handle_session_update(
+                    acp::SessionUpdate::ToolCallUpdate(
+                        acp::ToolCallUpdate::new("task", acp::ToolCallUpdateFields::new())
+                            .meta(metadata),
+                    ),
+                    cx,
+                )
+            })
+            .expect("apply task updates");
+
+        assert_eq!(spawned.borrow().as_slice(), &[acp::SessionId::new("child")]);
+        thread.read_with(cx, |thread, _| {
+            assert!(matches!(
+                &thread.entries()[0],
+                AgentThreadEntry::ToolCall(call) if call.is_subagent()
+            ));
+        });
     }
 
     #[test]
@@ -9931,6 +10184,8 @@ mod tests {
             let usage = thread.token_usage().expect("token_usage should be set");
             assert_eq!(usage.max_tokens, 10000);
             assert_eq!(usage.used_tokens, 5000);
+            assert_eq!(usage.input_tokens, None);
+            assert_eq!(usage.output_tokens, None);
 
             let cost = thread.cost().expect("cost should be set");
             assert!((cost.amount - 0.42).abs() < f64::EPSILON);
@@ -10087,9 +10342,14 @@ mod tests {
             let usage = thread.token_usage().expect("token_usage should be set");
             assert_eq!(usage.max_tokens, 10000, "max_tokens from UsageUpdate");
             assert_eq!(usage.used_tokens, 3000, "used_tokens from UsageUpdate");
-            assert_eq!(usage.input_tokens, 200, "input_tokens from response usage");
             assert_eq!(
-                usage.output_tokens, 300,
+                usage.input_tokens,
+                Some(200),
+                "input_tokens from response usage"
+            );
+            assert_eq!(
+                usage.output_tokens,
+                Some(300),
                 "output_tokens from response usage"
             );
 

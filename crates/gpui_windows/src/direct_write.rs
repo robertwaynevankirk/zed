@@ -1541,12 +1541,16 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
                 "DirectWrite returned a null glyph advances array",
             )?
         };
-        let glyph_offsets = unsafe {
-            slice_from_nullable(
-                glyphrun.glyphOffsets,
-                glyph_count,
-                "DirectWrite returned a null glyph offsets array",
-            )?
+        let glyph_offsets = if glyphrun.glyphOffsets.is_null() {
+            None
+        } else {
+            Some(unsafe {
+                slice_from_nullable(
+                    glyphrun.glyphOffsets,
+                    glyph_count,
+                    "DirectWrite returned a null glyph offsets array",
+                )?
+            })
         };
         let cluster_map = unsafe {
             slice_from_nullable(
@@ -1572,11 +1576,15 @@ impl IDWriteTextRenderer_Impl for TextRenderer_Impl {
                 let is_emoji =
                     color_font && is_color_glyph(font_face, id, &context.components.factory);
                 let this_glyph_idx = glyph_idx + cluster_glyph_idx;
+                let advance_offset =
+                    glyph_offsets.map_or(0.0, |offsets| offsets[this_glyph_idx].advanceOffset);
+                let ascender_offset =
+                    glyph_offsets.map_or(0.0, |offsets| offsets[this_glyph_idx].ascenderOffset);
                 glyphs.push(ShapedGlyph {
                     id,
                     position: point(
-                        px(context.width + glyph_offsets[this_glyph_idx].advanceOffset),
-                        px(-glyph_offsets[this_glyph_idx].ascenderOffset),
+                        px(context.width + advance_offset),
+                        px(-ascender_offset),
                     ),
                     index: context.index_converter.utf8_ix,
                     is_emoji,

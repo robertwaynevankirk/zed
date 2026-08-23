@@ -276,7 +276,7 @@ impl Conversation {
         let session_id = thread.read(cx).session_id().clone();
         let subscription = cx.subscribe(&thread, {
             let session_id = session_id.clone();
-            move |this, _thread, event, _cx| {
+            move |this, _thread, event, cx| {
                 this.updated_at = Some(Instant::now());
                 match event {
                     AcpThreadEvent::ToolAuthorizationRequested(id) => {
@@ -326,6 +326,7 @@ impl Conversation {
                     | AcpThreadEvent::WorkingDirectoriesUpdated
                     | AcpThreadEvent::PromptUpdated => {}
                 }
+                cx.notify();
             }
         });
         self.subscriptions.push(subscription);
@@ -408,6 +409,13 @@ impl Conversation {
         self.permission_requests
             .get(session_id)
             .map(|tool_call_ids| tool_call_ids.len())
+            .unwrap_or(0)
+    }
+
+    pub fn pending_elicitation_count_for_session(&self, session_id: &acp::SessionId) -> usize {
+        self.elicitation_requests
+            .get(session_id)
+            .map(|elicitation_ids| elicitation_ids.len())
             .unwrap_or(0)
     }
 
@@ -740,6 +748,8 @@ pub struct ConnectedServerState {
     auth_state: AuthState,
     active_id: Option<acp::SessionId>,
     pub(crate) threads: HashMap<acp::SessionId, Entity<ThreadView>>,
+    loading_subagent_sessions: HashSet<acp::SessionId>,
+    subagent_load_errors: HashMap<acp::SessionId, SharedString>,
     connection: Rc<dyn AgentConnection>,
     conversation: Entity<Conversation>,
     _connection_entry_subscription: Subscription,
@@ -1198,6 +1208,8 @@ impl ConversationView {
                                 auth_state: AuthState::Ok,
                                 active_id: Some(root_session_id.clone()),
                                 threads: HashMap::from_iter([(root_session_id, current)]),
+                                loading_subagent_sessions: HashSet::default(),
+                                subagent_load_errors: HashMap::default(),
                                 conversation,
                                 _connection_entry_subscription: connection_entry_subscription,
                                 _request_elicitation_subscription: request_elicitation_subscription,
@@ -1464,6 +1476,8 @@ impl ConversationView {
                         auth_state,
                         active_id: None,
                         threads: HashMap::default(),
+                        loading_subagent_sessions: HashSet::default(),
+                        subagent_load_errors: HashMap::default(),
                         connection,
                         conversation: cx.new(|_cx| Conversation::default()),
                         _connection_entry_subscription: Subscription::new(|| {}),
@@ -1585,6 +1599,7 @@ impl ConversationView {
             AcpThreadEvent::StatusChanged => {
                 if let Some(active) = self.thread_view(&session_id) {
                     active.update(cx, |active, cx| {
+                        active.sync_turn_timer(cx);
                         active.sync_generating_indicator(cx);
                     });
                 }
@@ -2039,10 +2054,12 @@ impl ConversationView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(connected) = self.as_connected() else {
+        let project = self.project.clone();
+        let Some(connected) = self.as_connected_mut() else {
             return;
         };
         if connected.threads.contains_key(&subagent_id)
+            || connected.loading_subagent_sessions.contains(&subagent_id)
             || !connected.connection.supports_load_session()
         {
             return;
@@ -2056,19 +2073,41 @@ impl ConversationView {
             .read(cx)
             .work_dirs()
             .cloned()
-            .unwrap_or_else(|| self.project.read(cx).default_path_list(cx));
+            .unwrap_or_else(|| project.read(cx).default_path_list(cx));
 
         let subagent_thread_task = connected.connection.clone().load_session(
-            subagent_id,
-            self.project.clone(),
+            subagent_id.clone(),
+            project,
             work_dirs,
             None,
             cx,
         );
+        connected.subagent_load_errors.remove(&subagent_id);
+        connected
+            .loading_subagent_sessions
+            .insert(subagent_id.clone());
+        cx.notify();
 
         cx.spawn_in(window, async move |this, cx| {
-            let subagent_thread = subagent_thread_task.await?;
+            let result = subagent_thread_task.await;
             this.update_in(cx, |this, window, cx| {
+                let Some(connected) = this.as_connected_mut() else {
+                    return;
+                };
+                connected.loading_subagent_sessions.remove(&subagent_id);
+                let subagent_thread = match result {
+                    Ok(thread) => thread,
+                    Err(error) => {
+                        connected
+                            .subagent_load_errors
+                            .insert(subagent_id.clone(), error.to_string().into());
+                        cx.notify();
+                        return;
+                    }
+                };
+                subagent_thread.update(cx, |thread, _cx| {
+                    thread.set_parent_session_id(parent_session_id.clone());
+                });
                 let Some(conversation) = this
                     .as_connected()
                     .map(|connected| connected.conversation.clone())
@@ -2085,6 +2124,7 @@ impl ConversationView {
                     return;
                 };
                 connected.threads.insert(subagent_session_id, view);
+                cx.notify();
             })
         })
         .detach();
@@ -3666,7 +3706,7 @@ fn plan_label_markdown_style(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use acp_thread::StubAgentConnection;
+    use acp_thread::{AgentSessionSteerResponse, StubAgentConnection};
     use action_log::ActionLog;
     use agent::{AgentTool, EditFileTool, FetchTool, TerminalTool, ToolPermissionContext};
     use agent_servers::FakeAcpAgentServer;
@@ -3683,6 +3723,7 @@ pub(crate) mod tests {
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
     use std::sync::Arc;
+    use std::time::Duration;
     use workspace::{Item, MultiWorkspace};
 
     use crate::agent_panel;
@@ -4159,6 +4200,225 @@ pub(crate) mod tests {
             assert!(
                 thread.message_queue.front_wants_steer(),
                 "steering should be on after toggling"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_external_steer_capability_controls_queue_action(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (ordinary_view, cx) =
+            setup_conversation_view(StubAgentServer::default_response(), cx).await;
+        active_thread(&ordinary_view, cx).read_with(cx, |thread, cx| {
+            assert!(!thread.can_steer_queued_messages(cx));
+        });
+
+        let connection =
+            StubAgentConnection::new().with_session_steer_response(AgentSessionSteerResponse {
+                accepted: true,
+                reason: None,
+            });
+        let (capable_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        active_thread(&capable_view, cx).read_with(cx, |thread, cx| {
+            assert!(thread.can_steer_queued_messages(cx));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_turn_timer_tracks_status_and_freezes_on_completion(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let editor = message_editor(&conversation_view, cx);
+        editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("hello", window, cx)
+        });
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        let (session_id, started_at) =
+            active_thread(&conversation_view, cx).read_with(cx, |view, _| {
+                (
+                    view.session_id.clone(),
+                    view.turn_fields
+                        .turn_started_at
+                        .expect("generating turn should start its timer"),
+                )
+            });
+        cx.executor().advance_clock(Duration::from_secs(3));
+        cx.run_until_parked();
+
+        cx.update(|_, _| connection.end_turn(session_id, acp::StopReason::EndTurn));
+        cx.run_until_parked();
+
+        active_thread(&conversation_view, cx).read_with(cx, |view, cx| {
+            assert!(view.turn_fields.turn_started_at.is_none());
+            assert!(view.turn_fields._turn_timer_task.is_none());
+            assert_eq!(
+                view.turn_fields.last_turn_duration,
+                Some(
+                    cx.background_executor()
+                        .now()
+                        .saturating_duration_since(started_at)
+                )
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_external_steer_dispatches_without_cancel(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection =
+            StubAgentConnection::new().with_session_steer_response(AgentSessionSteerResponse {
+                accepted: true,
+                reason: None,
+            });
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let editor = message_editor(&conversation_view, cx);
+        editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("first", window, cx)
+        });
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        active_thread(&conversation_view, cx).update_in(cx, |thread, window, cx| {
+            thread.add_to_queue(
+                vec![acp::ContentBlock::Text(acp::TextContent::new("steer"))],
+                vec![],
+                window,
+                cx,
+            );
+            let id = thread
+                .message_queue
+                .first_id()
+                .expect("queued entry should exist");
+            thread.toggle_queue_entry_steer(id, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(connection.cancel_count(), 0);
+        assert_eq!(connection.steer_requests().len(), 1);
+        active_thread(&conversation_view, cx).read_with(cx, |thread, cx| {
+            assert!(thread.message_queue.is_empty());
+            assert_eq!(thread.thread.read(cx).status(), ThreadStatus::Generating);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_external_steer_rejection_retains_queue_entry(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection =
+            StubAgentConnection::new().with_session_steer_response(AgentSessionSteerResponse {
+                accepted: false,
+                reason: Some("session is not at a steerable boundary".to_string()),
+            });
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+
+        active_thread(&conversation_view, cx).update_in(cx, |thread, window, cx| {
+            thread.add_to_queue(
+                vec![acp::ContentBlock::Text(acp::TextContent::new("steer"))],
+                vec![],
+                window,
+                cx,
+            );
+            let id = thread
+                .message_queue
+                .first_id()
+                .expect("queued entry should exist");
+            thread.toggle_queue_entry_steer(id, cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(connection.cancel_count(), 0);
+        active_thread(&conversation_view, cx).read_with(cx, |thread, _cx| {
+            assert_eq!(thread.message_queue.len(), 1);
+            assert!(thread.thread_error.is_some());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_external_steer_unsupported_falls_back_to_turn_end(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        // No `with_session_steer_response`: the connection advertises no steer
+        // capability, so the Steer button stays hidden and queueing must fall
+        // back to the standard "wait for the turn to end" behavior.
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        active_thread(&conversation_view, cx).read_with(cx, |thread, cx| {
+            assert!(
+                !thread.can_steer_queued_messages(cx),
+                "steer must stay hidden for connections without the capability"
+            );
+        });
+
+        let editor = message_editor(&conversation_view, cx);
+        editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("first", window, cx)
+        });
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        let session_id =
+            active_thread(&conversation_view, cx).read_with(cx, |view, _| view.session_id.clone());
+
+        // Queue a follow-up while the agent is generating. Steer is unavailable,
+        // so the message must wait for the turn to end rather than being injected
+        // mid-turn through `_opencode/session/steer`.
+        active_thread(&conversation_view, cx).update_in(cx, |thread, window, cx| {
+            thread.add_to_queue(
+                vec![acp::ContentBlock::Text(acp::TextContent::new("follow-up"))],
+                vec![],
+                window,
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        assert!(
+            connection.steer_requests().is_empty(),
+            "no custom steer request should be sent without the capability"
+        );
+        assert_eq!(connection.cancel_count(), 0);
+        active_thread(&conversation_view, cx).read_with(cx, |thread, _cx| {
+            assert_eq!(
+                thread.message_queue.len(),
+                1,
+                "queued entry must wait for the turn to end"
+            );
+        });
+
+        // Ending the turn releases the queued message through the standard path.
+        connection.end_turn(session_id, acp::StopReason::EndTurn);
+        cx.run_until_parked();
+
+        assert!(
+            connection.steer_requests().is_empty(),
+            "the fallback path must never dispatch a steer request"
+        );
+        active_thread(&conversation_view, cx).read_with(cx, |thread, _cx| {
+            assert_eq!(
+                thread.message_queue.len(),
+                0,
+                "queued message should be sent once the turn ends"
             );
         });
     }
@@ -10150,6 +10410,109 @@ pub(crate) mod tests {
             assert_eq!(returned_session_id, parent_session_id);
             assert_eq!(tool_call_id, acp::ToolCallId::new("parent-tc"));
         });
+    }
+
+    fn subagent_metadata(session_id: &str) -> acp::Meta {
+        acp::Meta::from_iter([(
+            acp_thread::SUBAGENT_SESSION_INFO_META_KEY.into(),
+            json!({
+                "session_id": session_id,
+                "message_start_index": 0,
+                "message_end_index": null
+            }),
+        )])
+    }
+
+    #[gpui::test]
+    async fn test_external_subagent_metadata_loads_and_registers_child(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = StubAgentConnection::new().with_supports_load_session(true);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let parent_session_id = active_thread(&conversation_view, cx)
+            .read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
+        let child_session_id = acp::SessionId::new("external-child");
+
+        cx.update(|_, cx| {
+            connection.send_update(
+                parent_session_id.clone(),
+                acp::SessionUpdate::ToolCall(
+                    acp::ToolCall::new("task", "Audit external task")
+                        .kind(acp::ToolKind::Think)
+                        .status(acp::ToolCallStatus::InProgress)
+                        .meta(subagent_metadata(child_session_id.0.as_ref())),
+                ),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        conversation_view.read_with(cx, |view, cx| {
+            let child_view = view
+                .thread_view(&child_session_id)
+                .expect("metadata should promptly register the child thread");
+            assert_eq!(
+                child_view.read(cx).thread.read(cx).parent_session_id(),
+                Some(&parent_session_id)
+            );
+        });
+        assert_eq!(
+            connection.load_session_calls(),
+            vec![child_session_id.clone()]
+        );
+
+        cx.update(|_, cx| {
+            connection.send_update(
+                parent_session_id,
+                acp::SessionUpdate::ToolCallUpdate(
+                    acp::ToolCallUpdate::new("task", acp::ToolCallUpdateFields::new())
+                        .meta(subagent_metadata(child_session_id.0.as_ref())),
+                ),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            connection.load_session_calls(),
+            vec![child_session_id],
+            "repeated metadata must not reload an existing child"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_external_subagent_without_load_support_stays_fallback(cx: &mut TestAppContext) {
+        init_test(cx);
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let parent_session_id = active_thread(&conversation_view, cx)
+            .read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
+        let child_session_id = acp::SessionId::new("unsupported-child");
+
+        cx.update(|_, cx| {
+            connection.send_update(
+                parent_session_id,
+                acp::SessionUpdate::ToolCall(
+                    acp::ToolCall::new("task", "Fallback task title")
+                        .kind(acp::ToolKind::Think)
+                        .status(acp::ToolCallStatus::InProgress)
+                        .meta(subagent_metadata(child_session_id.0.as_ref())),
+                ),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        conversation_view.read_with(cx, |view, cx| {
+            assert!(view.thread_view(&child_session_id).is_none());
+            let root = view.root_thread(cx).expect("root thread");
+            assert!(matches!(
+                &root.read(cx).entries()[0],
+                AgentThreadEntry::ToolCall(call)
+                    if call.is_subagent() && call.label.read(cx).source() == "Fallback task title"
+            ));
+        });
+        assert!(connection.load_session_calls().is_empty());
     }
 
     #[gpui::test]

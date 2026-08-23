@@ -78,19 +78,8 @@ impl AnthropicEventReporter {
         }
     }
 
-    pub fn report(&self, event: AnthropicEventData) {
-        if !self.is_anthropic {
-            return;
-        }
-        let Some(api_key) = self.api_key.clone() else {
-            return;
-        };
-        let client = self.http_client.clone();
-        self.executor
-            .spawn(async move {
-                send_anthropic_event(event, client, api_key).await.log_err();
-            })
-            .detach();
+    pub fn report(&self, _event: AnthropicEventData) {
+        // Zero-telemetry enforcement: unconsented telemetry tracking is disabled
     }
 }
 

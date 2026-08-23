@@ -10,7 +10,8 @@ use std::cell::RefCell;
 
 use acp_thread::{
     Elicitation, ElicitationEntryId, ElicitationStatus, PlanEntry, SandboxAuthorizationDetails,
-    SandboxFallbackAuthorizationDetails, SandboxNotAppliedReason, decode_path_escapes,
+    SandboxFallbackAuthorizationDetails, SandboxNotAppliedReason, SubagentBlockedReason,
+    decode_path_escapes, split_subagent_blocked_suffix,
 };
 use agent::{
     SandboxStatusKey, SandboxStatusRefresh, SkillLoadingIssue, SkillLoadingIssueKind,
@@ -687,6 +688,13 @@ enum ToolCallLayout {
     Floating,
 }
 
+#[derive(Clone)]
+enum SubagentLoadState {
+    Loading,
+    Unsupported,
+    Unavailable(SharedString),
+}
+
 impl ToolCallLayout {
     /// Stable discriminant used to disambiguate element ids when the same tool
     /// call is rendered in more than one layout at once (e.g. inline in the
@@ -899,6 +907,10 @@ impl ThreadView {
             Self::handle_entry_view_event,
         ));
 
+        subscriptions.push(cx.observe(&conversation, |_this, _conversation, cx| {
+            cx.notify();
+        }));
+
         subscriptions.push(cx.subscribe_in(
             &message_editor,
             window,
@@ -1053,6 +1065,7 @@ impl ThreadView {
         };
 
         this.sync_generating_indicator(cx);
+        this.sync_turn_timer(cx);
         this.sync_editor_mode(cx);
         this.sync_existing_elicitation_states(window, cx);
         let list_state_for_scroll = this.list_state.clone();
@@ -1391,7 +1404,7 @@ impl ThreadView {
     pub fn start_turn(&mut self, cx: &mut Context<Self>) -> usize {
         self.turn_fields.turn_generation += 1;
         let generation = self.turn_fields.turn_generation;
-        self.turn_fields.turn_started_at = Some(Instant::now());
+        self.turn_fields.turn_started_at = Some(cx.background_executor().now());
         self.turn_fields.last_turn_duration = None;
         self.turn_fields.last_turn_tokens = None;
         self.turn_fields.turn_tokens = Some(0);
@@ -1406,23 +1419,47 @@ impl ThreadView {
         generation
     }
 
-    pub fn stop_turn(&mut self, generation: usize, _cx: &mut Context<Self>) {
-        if self.turn_fields.turn_generation != generation {
+    pub fn stop_turn(&mut self, generation: usize, cx: &mut Context<Self>) {
+        if self.turn_fields.turn_generation != generation
+            || self.turn_fields.turn_started_at.is_none()
+        {
             return;
         }
-        self.turn_fields.last_turn_duration = self
-            .turn_fields
-            .turn_started_at
-            .take()
-            .map(|started| started.elapsed());
+        self.turn_fields.last_turn_duration =
+            self.turn_fields.turn_started_at.take().map(|started| {
+                cx.background_executor()
+                    .now()
+                    .saturating_duration_since(started)
+            });
         self.turn_fields.last_turn_tokens = self.turn_fields.turn_tokens.take();
         self.turn_fields._turn_timer_task = None;
+    }
+
+    pub(crate) fn sync_turn_timer(&mut self, cx: &mut Context<Self>) {
+        let generating = self.thread.read(cx).status() == ThreadStatus::Generating;
+        match (generating, self.turn_fields.turn_started_at) {
+            (true, None) => {
+                self.start_turn(cx);
+            }
+            (false, Some(_)) => {
+                self.stop_turn(self.turn_fields.turn_generation, cx);
+            }
+            _ => {}
+        }
+    }
+
+    fn turn_elapsed(&self, cx: &App) -> Option<Duration> {
+        self.turn_fields.turn_started_at.map(|started| {
+            cx.background_executor()
+                .now()
+                .saturating_duration_since(started)
+        })
     }
 
     pub fn update_turn_tokens(&mut self, cx: &App) {
         if let Some(usage) = self.thread.read(cx).token_usage() {
             if let Some(tokens) = &mut self.turn_fields.turn_tokens {
-                *tokens += usage.output_tokens;
+                *tokens += usage.output_tokens.unwrap_or(0);
                 self.emit_token_limit_telemetry_if_needed(cx);
             }
         }
@@ -2147,6 +2184,8 @@ impl ThreadView {
             content,
             tracked_buffers,
             steer: false,
+            steer_request_id: ClientUserMessageId::new(),
+            steer_pending: false,
             editor,
             _subscription: subscription,
         });
@@ -2223,10 +2262,79 @@ impl ThreadView {
         removed
     }
 
-    fn toggle_queue_entry_steer(&mut self, id: QueueEntryId, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_queue_entry_steer(&mut self, id: QueueEntryId, cx: &mut Context<Self>) {
         self.message_queue.toggle_steer(id);
         self.sync_queue_flag_to_native_thread(cx);
+        self.dispatch_external_steer(id, cx);
         cx.notify();
+    }
+
+    pub(crate) fn can_steer_queued_messages(&self, cx: &App) -> bool {
+        if self.as_native_thread(cx).is_some() {
+            return true;
+        }
+        let thread = self.thread.read(cx);
+        thread
+            .connection()
+            .session_steer(thread.session_id(), cx)
+            .is_some()
+    }
+
+    fn dispatch_external_steer(&mut self, id: QueueEntryId, cx: &mut Context<Self>) {
+        if self.as_native_thread(cx).is_some() {
+            return;
+        }
+        let thread = self.thread.read(cx);
+        let Some(steer) = thread.connection().session_steer(thread.session_id(), cx) else {
+            return;
+        };
+        let Some((prompt, request_id)) = self.message_queue.begin_external_steer(id) else {
+            return;
+        };
+        let accepted_prompt = prompt.clone();
+        let accepted_request_id = request_id.clone();
+        cx.notify();
+
+        let task = steer.run(prompt, request_id, cx);
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| match result {
+                Ok(response) if response.accepted => {
+                    if this.message_queue.finish_external_steer(id, true).is_some() {
+                        this.thread.update(cx, |thread, cx| {
+                            thread.record_steered_user_message(
+                                accepted_prompt,
+                                accepted_request_id,
+                                cx,
+                            );
+                        });
+                    }
+                    if let Some(next_id) = this.message_queue.first_id() {
+                        this.dispatch_external_steer(next_id, cx);
+                    }
+                    cx.notify();
+                }
+                Ok(response) => {
+                    this.message_queue.finish_external_steer(id, false);
+                    let reason = response
+                        .reason
+                        .unwrap_or_else(|| "The agent did not provide a reason.".to_string());
+                    this.handle_thread_error(
+                        anyhow::anyhow!("The agent rejected the queued steer message: {reason}"),
+                        cx,
+                    );
+                }
+                Err(error) => {
+                    this.message_queue.finish_external_steer(id, false);
+                    this.handle_thread_error(
+                        anyhow::anyhow!("Could not steer the running agent: {error}"),
+                        cx,
+                    );
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub fn sync_queue_flag_to_native_thread(&self, cx: &mut Context<Self>) {
@@ -4443,6 +4551,7 @@ impl ThreadView {
                                     .min_w_0()
                                     .flex_wrap()
                                     .gap_1()
+                                    .children(self.render_turn_elapsed(cx))
                                     .children(self.render_token_usage(cx))
                                     .children(self.profile_selector.clone())
                                     .map(|this| match self.config_options_view.clone() {
@@ -4502,7 +4611,7 @@ impl ThreadView {
 
         let queue_len = self.message_queue.len();
         let can_fast_track = self.message_queue.can_fast_track();
-        let is_native = self.as_native_thread(cx).is_some();
+        let can_steer = self.can_steer_queued_messages(cx);
 
         v_flex()
             .id("message_queue_list")
@@ -4567,7 +4676,7 @@ impl ThreadView {
                                         );
                                     })),
                             )
-                            .when(is_native, |row| {
+                            .when(can_steer, |row| {
                                 row.child(self.render_queue_steer_button(
                                     entry_id, index, is_next, steer_on, cx,
                                 ))
@@ -4641,7 +4750,7 @@ impl ThreadView {
                                         );
                                     })),
                             )
-                            .when(is_native, |row| {
+                            .when(can_steer, |row| {
                                 row.child(self.render_queue_steer_button(
                                     entry_id, index, is_next, steer_on, cx,
                                 ))
@@ -4681,19 +4790,28 @@ impl ThreadView {
             .is_some_and(|model| model.supports_split_token_display())
     }
 
+    fn render_turn_elapsed(&self, cx: &App) -> Option<impl IntoElement> {
+        // While generating, show the live elapsed time. Once the turn
+        // completes the live value is gone, so fall back to the frozen
+        // last-turn duration and keep it visible until the next prompt
+        // begins (which clears it in `start_turn`).
+        let elapsed = self.turn_elapsed(cx).or(self.turn_fields.last_turn_duration)?;
+        Some(
+            Label::new(duration_alt_display(elapsed))
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+        )
+    }
+
     fn render_token_usage(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let thread = self.thread.read(cx);
         let usage = thread.token_usage()?;
-        let show_split = self.supports_split_token_display(cx);
+        let show_split_rings = self.supports_split_token_display(cx)
+            && usage.input_tokens.is_some()
+            && usage.output_tokens.is_some();
+        let show_split_totals = usage.input_tokens.is_some() && usage.output_tokens.is_some();
 
-        let cost_label = thread.cost().map(|cost| {
-            let precision = if cost.amount > 0.0 && cost.amount < 0.01 {
-                4
-            } else {
-                2
-            };
-            format!("{:.prec$} {}", cost.amount, cost.currency, prec = precision)
-        });
+        let cost_label = thread.cost().map(format_session_cost);
 
         let progress_color = |ratio: f32| -> Hsla {
             if ratio >= 0.85 {
@@ -4705,8 +4823,10 @@ impl ThreadView {
 
         let used = crate::humanize_token_count(usage.used_tokens);
         let max = crate::humanize_token_count(usage.max_tokens);
-        let input_tokens_label = crate::humanize_token_count(usage.input_tokens);
-        let output_tokens_label = crate::humanize_token_count(usage.output_tokens);
+        let input_tokens_label = usage.input_tokens.map(crate::humanize_token_count);
+        let output_tokens_label = usage.output_tokens.map(crate::humanize_token_count);
+        let tooltip_input_tokens_label = input_tokens_label.clone();
+        let tooltip_output_tokens_label = output_tokens_label.clone();
 
         let progress_ratio = if usage.max_tokens > 0 {
             usage.used_tokens as f32 / usage.max_tokens as f32
@@ -4751,18 +4871,19 @@ impl ThreadView {
             crate::humanize_token_count(usage.max_tokens.saturating_sub(max_output_tokens));
         let output_max_label = crate::humanize_token_count(max_output_tokens);
 
+        let tooltip_cost_label = cost_label.clone();
         let build_tooltip = {
             move |_window: &mut Window, cx: &mut App| {
                 let percentage = percentage.clone();
                 let used = used.clone();
                 let max = max.clone();
-                let input_tokens_label = input_tokens_label.clone();
-                let output_tokens_label = output_tokens_label.clone();
+                let input_tokens_label = tooltip_input_tokens_label.clone();
+                let output_tokens_label = tooltip_output_tokens_label.clone();
                 let input_max_label = input_max_label.clone();
                 let output_max_label = output_max_label.clone();
                 let project_entry_ids = project_entry_ids.clone();
                 let workspace = workspace.clone();
-                let cost_label = cost_label.clone();
+                let cost_label = tooltip_cost_label.clone();
                 cx.new(move |_cx| TokenUsageTooltip {
                     percentage,
                     used,
@@ -4771,7 +4892,7 @@ impl ThreadView {
                     output_tokens: output_tokens_label,
                     input_max: input_max_label,
                     output_max: output_max_label,
-                    show_split,
+                    show_split: show_split_totals,
                     cost_label,
                     separator_color: tooltip_separator_color,
                     global_agents_md_loaded,
@@ -4783,17 +4904,19 @@ impl ThreadView {
             }
         };
 
-        if show_split {
+        if show_split_rings {
+            let input_tokens = usage.input_tokens.unwrap_or(0);
+            let output_tokens = usage.output_tokens.unwrap_or(0);
             let input_max_raw = usage.max_tokens.saturating_sub(max_output_tokens);
             let output_max_raw = max_output_tokens;
 
             let input_ratio = if input_max_raw > 0 {
-                usage.input_tokens as f32 / input_max_raw as f32
+                input_tokens as f32 / input_max_raw as f32
             } else {
                 0.0
             };
             let output_ratio = if output_max_raw > 0 {
-                usage.output_tokens as f32 / output_max_raw as f32
+                output_tokens as f32 / output_max_raw as f32
             } else {
                 0.0
             };
@@ -4814,13 +4937,18 @@ impl ThreadView {
                             )
                             .child(
                                 CircularProgress::new(
-                                    usage.input_tokens as f32,
+                                    input_tokens as f32,
                                     input_max_raw as f32,
                                     ring_size,
                                     cx,
                                 )
                                 .stroke_width(stroke_width)
                                 .progress_color(progress_color(input_ratio)),
+                            )
+                            .child(
+                                Label::new(input_tokens_label.clone().unwrap_or_default())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
                             ),
                     )
                     .child(
@@ -4833,15 +4961,23 @@ impl ThreadView {
                             )
                             .child(
                                 CircularProgress::new(
-                                    usage.output_tokens as f32,
+                                    output_tokens as f32,
                                     output_max_raw as f32,
                                     ring_size,
                                     cx,
                                 )
                                 .stroke_width(stroke_width)
                                 .progress_color(progress_color(output_ratio)),
+                            )
+                            .child(
+                                Label::new(output_tokens_label.clone().unwrap_or_default())
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
                             ),
                     )
+                    .when_some(cost_label.clone(), |this, cost| {
+                        this.child(Label::new(cost).size(LabelSize::Small).color(Color::Muted))
+                    })
                     .hoverable_tooltip(build_tooltip)
                     .into_any_element(),
             )
@@ -4861,6 +4997,39 @@ impl ThreadView {
                         .stroke_width(stroke_width)
                         .progress_color(progress_color(progress_ratio)),
                     )
+                    .when_some(input_tokens_label, |this, input| {
+                        this.child(
+                            h_flex()
+                                .gap_0p5()
+                                .child(
+                                    Icon::new(IconName::ArrowUp)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    Label::new(input).size(LabelSize::Small).color(Color::Muted),
+                                ),
+                        )
+                    })
+                    .when_some(output_tokens_label, |this, output| {
+                        this.child(
+                            h_flex()
+                                .gap_0p5()
+                                .child(
+                                    Icon::new(IconName::ArrowDown)
+                                        .size(IconSize::XSmall)
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    Label::new(output)
+                                        .size(LabelSize::Small)
+                                        .color(Color::Muted),
+                                ),
+                        )
+                    })
+                    .when_some(cost_label, |this, cost| {
+                        this.child(Label::new(cost).size(LabelSize::Small).color(Color::Muted))
+                    })
                     .hoverable_tooltip(build_tooltip)
                     .into_any_element(),
             )
@@ -5712,8 +5881,8 @@ struct TokenUsageTooltip {
     percentage: String,
     used: String,
     max: String,
-    input_tokens: String,
-    output_tokens: String,
+    input_tokens: Option<String>,
+    output_tokens: Option<String>,
     input_max: String,
     output_max: String,
     show_split: bool,
@@ -5723,6 +5892,43 @@ struct TokenUsageTooltip {
     project_rules_count: usize,
     project_entry_ids: Vec<ProjectEntryId>,
     workspace: WeakEntity<Workspace>,
+}
+
+fn format_session_cost(cost: &acp_thread::SessionCost) -> String {
+    let precision = if cost.amount > 0.0 && cost.amount < 0.01 {
+        4
+    } else {
+        2
+    };
+    format!(
+        "{:.precision$} {}",
+        cost.amount,
+        cost.currency,
+        precision = precision
+    )
+}
+
+#[cfg(test)]
+mod observability_tests {
+    use super::*;
+
+    #[test]
+    fn formats_session_cost_with_currency_and_small_amount_precision() {
+        assert_eq!(
+            format_session_cost(&acp_thread::SessionCost {
+                amount: 0.0042,
+                currency: "EUR".into(),
+            }),
+            "0.0042 EUR"
+        );
+        assert_eq!(
+            format_session_cost(&acp_thread::SessionCost {
+                amount: 1.5,
+                currency: "JPY".into(),
+            }),
+            "1.50 JPY"
+        );
+    }
 }
 
 impl Render for TokenUsageTooltip {
@@ -5769,7 +5975,9 @@ impl Render for TokenUsageTooltip {
                                 h_flex()
                                     .gap_0p5()
                                     .child(Label::new("Input:").color(Color::Muted).mr_0p5())
-                                    .child(Label::new(input_tokens))
+                                    .child(Label::new(
+                                        input_tokens.unwrap_or_else(|| "Unknown".into()),
+                                    ))
                                     .child(Label::new("/").color(separator_color))
                                     .child(Label::new(input_max).color(Color::Muted)),
                             )
@@ -5777,7 +5985,9 @@ impl Render for TokenUsageTooltip {
                                 h_flex()
                                     .gap_0p5()
                                     .child(Label::new("Output:").color(Color::Muted).mr_0p5())
-                                    .child(Label::new(output_tokens))
+                                    .child(Label::new(
+                                        output_tokens.unwrap_or_else(|| "Unknown".into()),
+                                    ))
                                     .child(Label::new("/").color(separator_color))
                                     .child(Label::new(output_max).color(Color::Muted)),
                             ),
@@ -10530,6 +10740,23 @@ impl ThreadView {
         window: &Window,
         cx: &Context<Self>,
     ) -> Div {
+        let subagent_load_state = subagent_session_id.as_ref().and_then(|session_id| {
+            self.server_view.upgrade().and_then(|server_view| {
+                let server_view = server_view.read(cx);
+                let connected = server_view.as_connected()?;
+                if connected.loading_subagent_sessions.contains(session_id) {
+                    Some(SubagentLoadState::Loading)
+                } else if let Some(error) = connected.subagent_load_errors.get(session_id) {
+                    Some(SubagentLoadState::Unavailable(error.clone()))
+                } else if !connected.connection.supports_load_session()
+                    && !connected.threads.contains_key(session_id)
+                {
+                    Some(SubagentLoadState::Unsupported)
+                } else {
+                    None
+                }
+            })
+        });
         let subagent_thread_view = subagent_session_id.and_then(|session_id| {
             self.server_view
                 .upgrade()
@@ -10542,6 +10769,7 @@ impl ThreadView {
             entry_ix,
             subagent_thread_view,
             tool_call,
+            subagent_load_state,
             focus_handle,
             window,
             cx,
@@ -10556,6 +10784,7 @@ impl ThreadView {
         entry_ix: usize,
         thread_view: Option<&Entity<ThreadView>>,
         tool_call: &ToolCall,
+        subagent_load_state: Option<SubagentLoadState>,
         focus_handle: &FocusHandle,
         window: &Window,
         cx: &Context<Self>,
@@ -10578,6 +10807,12 @@ impl ThreadView {
                 self.conversation.read(cx).pending_tool_call(sid, cx)
             })
             .is_some();
+        let is_pending_elicitation = subagent_session_id.as_ref().is_some_and(|session_id| {
+            self.conversation
+                .read(cx)
+                .pending_elicitation_count_for_session(session_id)
+                > 0
+        });
 
         let is_expanded = self
             .entry_view_state
@@ -10610,7 +10845,12 @@ impl ThreadView {
             .as_ref()
             .and_then(|t| t.read(cx).title())
             .filter(|t| !t.is_empty());
-        let tool_call_label = tool_call.label.read(cx).source().to_string();
+        // External agents that cannot rely on the client loading the child
+        // session append a `(blocked on …)` suffix to the parent tool-call
+        // title. Strip it from the displayed label and surface the reason as a
+        // blocked state so the card renders meaningfully without a child thread.
+        let (tool_call_label, label_blocked_reason) =
+            split_subagent_blocked_suffix(tool_call.label.read(cx).source().as_ref());
         let has_tool_call_label = !tool_call_label.is_empty();
 
         let has_title = thread_title.is_some() || has_tool_call_label;
@@ -10619,20 +10859,50 @@ impl ThreadView {
         let title: SharedString = if let Some(thread_title) = thread_title {
             thread_title
         } else if !tool_call_label.is_empty() {
-            tool_call_label.into()
+            tool_call_label
         } else if is_cancelled {
             "Subagent Canceled".into()
         } else if is_failed {
             "Subagent Failed".into()
+        } else if let Some(tool_name) = tool_call.tool_name.as_ref() {
+            match tool_name.as_ref() {
+                "task" => "Task".into(),
+                "spawn_agent" => "Subagent".into(),
+                tool_name => tool_name.replace('_', " ").into(),
+            }
         } else {
-            "Spawning Agent…".into()
+            "Subagent".into()
+        };
+
+        let is_blocked =
+            is_pending_tool_call || is_pending_elicitation || label_blocked_reason.is_some();
+        let state_label: Option<SharedString> = if is_pending_tool_call {
+            Some("Waiting for permission".into())
+        } else if is_pending_elicitation {
+            Some("Waiting for input".into())
+        } else if let Some(reason) = label_blocked_reason {
+            Some(match reason {
+                SubagentBlockedReason::Permission => "Blocked on permission".into(),
+                SubagentBlockedReason::Question => "Blocked on question".into(),
+            })
+        } else {
+            subagent_load_state.as_ref().map(|state| match state {
+                SubagentLoadState::Loading => "Loading child session…".into(),
+                SubagentLoadState::Unsupported => "Child session unavailable".into(),
+                SubagentLoadState::Unavailable(_) => "Unable to load child session".into(),
+            })
         };
 
         let card_header_id = format!("subagent-header-{}", entry_ix);
         let status_icon = format!("status-icon-{}", entry_ix);
         let diff_stat_id = format!("subagent-diff-{}", entry_ix);
 
-        let icon = h_flex().w_4().justify_center().child(if is_running {
+        let icon = h_flex().w_4().justify_center().child(if is_blocked {
+            Icon::new(IconName::Warning)
+                .size(IconSize::Small)
+                .color(Color::Warning)
+                .into_any_element()
+        } else if is_running || matches!(subagent_load_state, Some(SubagentLoadState::Loading)) {
             SpinnerLabel::new()
                 .size(LabelSize::Small)
                 .into_any_element()
@@ -10715,6 +10985,17 @@ impl ThreadView {
                                             .size(LabelSize::Custom(self.tool_name_font_size()))
                                             .truncate(),
                                     )
+                                    .when_some(state_label, |this, state_label| {
+                                        this.child(
+                                            Label::new(format!("— {state_label}"))
+                                                .size(LabelSize::Custom(self.tool_name_font_size()))
+                                                .color(if is_blocked {
+                                                    Color::Warning
+                                                } else {
+                                                    Color::Muted
+                                                }),
+                                        )
+                                    })
                                     .when(files_changed > 0, |this| {
                                         this.child(
                                             Label::new(format!(
@@ -10872,6 +11153,16 @@ impl ThreadView {
                         .child(fullscreen_toggle)
                     })
                 }
+            })
+            .when_some(subagent_load_state, |this, state| match state {
+                SubagentLoadState::Unavailable(error) => this.child(
+                    div().px_2().pb_2().child(
+                        Label::new(error.to_string())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+                ),
+                SubagentLoadState::Loading | SubagentLoadState::Unsupported => this,
             })
             .into_any_element()
     }
@@ -12354,7 +12645,7 @@ impl Render for ThreadView {
             }))
             .on_action(
                 cx.listener(|this, _: &ToggleSteerFirstQueuedMessage, _, cx| {
-                    if this.as_native_thread(cx).is_none() {
+                    if !this.can_steer_queued_messages(cx) {
                         return;
                     }
                     if let Some(id) = this.message_queue.first_id() {

@@ -60,3 +60,34 @@ crates/docs_preprocessor/actions.json
 .nixos-test-history
 
 .local*
+
+# --- ZED SENTINEL AUTO-GENERATED ---
+node_modules/
+target/
+dist/
+out/
+build/
+.next/
+.lake/
+.elan/
+.mathlib/
+venv/
+.venv/
+__pycache__/
+*.log
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.pyc
+*.pyo
+*.so
+*.dylib
+*.dll
+*.wasm
+*.zip
+*.tar.gz
+*.db
+*.sqlite
+*.sqlite3
+# --- END ZED SENTINEL ---

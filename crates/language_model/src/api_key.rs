@@ -30,10 +30,19 @@ pub enum LoadStatus {
     Loaded(ApiKey),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ApiKey {
     source: ApiKeySource,
     key: Arc<str>,
+}
+
+impl std::fmt::Debug for ApiKey {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiKey")
+            .field("source", &self.source)
+            .field("key", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl ApiKeyState {
