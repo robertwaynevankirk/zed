@@ -1,8 +1,9 @@
 #![allow(clippy::disallowed_methods, reason = "build scripts are exempt")]
 
 fn main() {
+    let target = std::env::var("TARGET").unwrap_or_default();
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if target_os == "windows" {
+    if target_os == "windows" || target.contains("windows") {
         shader_compilation::compile_shaders();
     }
 }
