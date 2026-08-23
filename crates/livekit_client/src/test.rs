@@ -46,8 +46,62 @@ pub struct SessionStats {
     pub subscriber_stats: Vec<RtcStats>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct InboundRtpStats {
+    pub stream: RtpStreamStats,
+    pub received: ReceivedRtpStreamStats,
+    pub inbound: InboundRtpStreamStats,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RtpStreamStats {
+    pub kind: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ReceivedRtpStreamStats {
+    pub packets_received: u64,
+    pub packets_lost: i64,
+    pub jitter: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct InboundRtpStreamStats {
+    pub track_identifier: String,
+    pub jitter_buffer_delay: f64,
+    pub jitter_buffer_emitted_count: u64,
+    pub concealed_samples: u64,
+    pub concealment_events: u64,
+    pub inserted_samples_for_deceleration: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CandidatePairStats {
+    pub candidate_pair: CandidatePairDetails,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CandidatePairDetails {
+    pub current_round_trip_time: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RemoteInboundRtpStats {
+    pub remote_inbound: RemoteInboundDetails,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RemoteInboundDetails {
+    pub round_trip_time: f64,
+}
+
 #[derive(Clone, Debug)]
-pub enum RtcStats {}
+pub enum RtcStats {
+    CandidatePair(CandidatePairStats),
+    InboundRtp(InboundRtpStats),
+    RemoteInboundRtp(RemoteInboundRtpStats),
+    Other,
+}
 
 static SERVERS: Mutex<BTreeMap<String, Arc<TestServer>>> = Mutex::new(BTreeMap::new());
 
