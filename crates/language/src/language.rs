@@ -135,6 +135,7 @@ where
     F: FnOnce(&mut Parser) -> R,
 {
     let mut parser = PARSERS.lock().pop().unwrap_or_else(|| {
+        #[allow(unused_mut)]
         let mut parser = Parser::new();
         #[cfg(not(windows))]
         parser
