@@ -633,8 +633,7 @@ impl WindowsWindowInner {
             Some(POINT {
                 // logical to physical
                 x: (caret_position.origin.x.as_f32() * scale_factor) as i32,
-                y: (caret_position.origin.y.as_f32() * scale_factor) as i32
-                    + ((caret_position.size.height.as_f32() * scale_factor) as i32 / 2),
+                y: ((caret_position.origin.y.as_f32() + caret_position.size.height.as_f32()) * scale_factor) as i32,
             })
         })
     }
@@ -1641,6 +1640,9 @@ fn process_key(vkey: VIRTUAL_KEY, scan_code: u16) -> (Option<String>, bool) {
 fn parse_ime_composition_string(ctx: HIMC, comp_type: IME_COMPOSITION_STRING) -> Option<Vec<u16>> {
     unsafe {
         let string_len = ImmGetCompositionStringW(ctx, comp_type, None, 0);
+        if string_len == 0 {
+            return Some(Vec::new());
+        }
         if string_len > 0 {
             let u16_len = string_len as usize / 2;
             let mut buffer = vec![0u16; u16_len];
