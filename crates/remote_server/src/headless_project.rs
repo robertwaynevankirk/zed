@@ -541,22 +541,19 @@ impl HeadlessProject {
             }
         });
 
-        // We spawn this asynchronously, so that we can send the response back
-        // *before* `worktree_store.add()` can send out UpdateProject requests
-        // to the client about the new worktree.
-        //
-        // That lets the client manage the reference/handles of the newly-added
-        // worktree, before getting interrupted by an UpdateProject request.
-        //
-        // This fixes the problem of the client sending the AddWorktree request,
-        // headless project sending out a project update, client receiving it
-        // and immediately dropping the reference of the new client, causing it
-        // to be dropped on the headless project, and the client only then
-        // receiving a response to AddWorktree.
+        this.update(&mut cx, |this, cx| {
+            this.worktree_store.update(cx, |worktree_store, cx| {
+                worktree_store.add_without_project_update(&worktree, cx);
+            });
+        });
+
+        // The worktree must be available to requests as soon as its ID is
+        // returned. Delay only the update notification so the client receives
+        // AddWorktreeResponse before it can observe the new worktree.
         cx.spawn(async move |cx| {
             this.update(cx, |this, cx| {
                 this.worktree_store.update(cx, |worktree_store, cx| {
-                    worktree_store.add(&worktree, cx);
+                    worktree_store.send_project_updates(cx);
                 });
             });
         })
